@@ -1,223 +1,504 @@
-#Cleware test script
-# test if USB-Contact was pressed
+# ============================================================
+#  SERVER WITH WEB UI (STATUS COLORS, AUTO REFRESH, EVENT LOG)
+# ============================================================
 
 import socket
 import threading
-from ctypes import *
-import time
-import sys, os
-from ClewareUSBLib import *
 import sys
-from urllib import response
-import winreg
+import os
+import re
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import unquote
+from ctypes import windll
+from typing import Dict, Tuple
+from datetime import datetime
 
-def send_help():
-    tResponse  = "Available Commands:\n\n"
-    tResponse += "list                       : lists all available USBSwitches (Devices)\n"
-    tResponse += "state   <devID>            : shows the current state of the specified USBSwitch\n"
-    tResponse += "turnon  <devID>            : turn ON  the specified USBSwitch \n"
-    tResponse += "turnoff <devID>            : turn OFF the specified USBSwitch \n"
-    tResponse += "toggle  <devID>            : toggle state of the specified USBSwitch \n"
-    tResponse += "rename  <devID> <new name> : renames the specified USBSwitch in List (no quotes required)\n"
-    tResponse += "exit                       : exits the application\n"
-    tResponse += "\n"
-    return tResponse
+# Cleware helpers (must be available in your environment)
+from ClewareUSBLib import (
+    cwUSB_getConfig,
+    cwUSB_list_Devices,
+    cwUSB_get_StateFromNum,
+    cwUSB_set_StateToNum,
+)
 
-def handle_client(conn, tLocalCommand):
-    bLocal = len(tLocalCommand) > 0
-    quit= False
+# ========================================
+# GLOBALS
+# ========================================
+connected_clients: Dict[str, Tuple[socket.socket, Tuple[str, int]]] = {}
+connected_lock = threading.Lock()
+
+event_log = []
+event_log_lock = threading.Lock()
+MAX_LOG_ENTRIES = 300
+
+server_name = None
+WEB_PORT = int(os.environ.get("CLEWARE_WEB_PORT", "8080"))
+
+# ========================================
+# EVENT LOGGING
+# ========================================
+def log_event(msg: str):
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    entry = f"[{timestamp}] {msg}"
+    print(entry)
+    with event_log_lock:
+        event_log.append(entry)
+        if len(event_log) > MAX_LOG_ENTRIES:
+            event_log.pop(0)
+
+# ========================================
+# LOCAL USB HELPERS
+# ========================================
+def load_local_dll():
+    dll_path = os.environ.get(
+        "CLEWARE_DLL_PATH",
+        os.path.join(os.path.dirname(__file__), "Source", "USBaccessX64.dll"),
+    )
+    return windll.LoadLibrary(dll_path)
+
+def list_local_devices():
+    try:
+        dll = load_local_dll()
+        dll.FCWInitObject()
+        devCnt = dll.FCWOpenCleware(0)
+        return cwUSB_list_Devices() if devCnt > 0 else ""
+    except Exception as e:
+        return f"ERROR:LOCAL_DEVICES({e})"
+
+def local_execute(cmd, devID):
+    try:
+        dll = load_local_dll()
+        dll.FCWInitObject()
+        devCnt = dll.FCWOpenCleware(0)
+        if devCnt == 0:
+            return "NO_LOCAL_DEVICES"
+
+        if cmd == "state":
+            return f"{cwUSB_get_StateFromNum(devID)}"
+
+        if cmd == "turnon":
+            cwUSB_set_StateToNum(devID, 1)
+            log_event(f"{server_name.upper()}: Turned ON device {devID}")
+            return "OK"
+
+        if cmd == "turnoff":
+            cwUSB_set_StateToNum(devID, 0)
+            log_event(f"{server_name.upper()}: Turned OFF device {devID}")
+            return "OK"
+
+        if cmd == "toggle":
+            cur = cwUSB_get_StateFromNum(devID)
+            cwUSB_set_StateToNum(devID, 0 if cur else 1)
+            log_event(f"{server_name.upper()}: Toggled device {devID}")
+            return "OK"
+
+        return "UNKNOWN_LOCAL_CMD"
+
+    except Exception as e:
+        return f"ERROR:{e}"
+
+# ========================================
+# CLIENT FORWARDING
+# ========================================
+def forward_to_client(client_name, command):
+    cname = client_name.lower()
+    with connected_lock:
+        entry = connected_clients.get(cname)
+
+    if not entry:
+        return "ERROR: CLIENT_NOT_CONNECTED"
+
+    sock, _ = entry
+    try:
+        sock.sendall(command.encode("utf-8"))
+        reply = sock.recv(65536)
+
+        if not reply:
+            with connected_lock:
+                connected_clients.pop(cname, None)
+            return "ERROR:CLIENT_DISCONNECTED"
+
+        reply_txt = reply.decode(errors="ignore").strip()
+
+        # Log actions (not logging 'state' to reduce noise)
+        if command.startswith("turn") or command.startswith("toggle"):
+            log_event(f"{cname.upper()}: Executed '{command}', result={reply_txt}")
+
+        return reply_txt
+
+    except Exception as e:
+        with connected_lock:
+            connected_clients.pop(cname, None)
+        return f"ERROR:COMM_FAIL({e})"
+
+# ========================================
+# MERGED LIST + STATUS COLORS
+# ========================================
+def extract_first_int(text):
+    m = re.search(r"\d+", text)
+    return m.group(0) if m else None
+
+def get_status_color(state_str):
+    try:
+        state = int(state_str)
+        if state == 1:
+            return "<span style='color:green;font-weight:bold'>ON</span>"
+        elif state == 0:
+            return "<span style='color:red;font-weight:bold'>OFF</span>"
+    except:
+        pass
+    return "<span style='color:gray'>?</span>"
+
+def merge_lists(server_node):
+    out = []
+
+    # SERVER devices
+    local = list_local_devices()
+    if local.strip():
+        for line in local.splitlines():
+            if line.strip():
+                out.append(f"{server_node}:{line}")
+    elif local.startswith("ERROR:"):
+        out.append(f"{server_node}:{local}")
+
+    # CLIENT devices
+    with connected_lock:
+        items = list(connected_clients.items())
+
+    for cname, (sock, addr) in items:
+        try:
+            sock.sendall(b"list")
+            txt = sock.recv(65536).decode(errors="ignore").strip()
+            if txt:
+                for line in txt.splitlines():
+                    if line.strip():
+                        out.append(f"{cname}:{line}")
+        except Exception as e:
+            # Drop dead client and show error row
+            with connected_lock:
+                connected_clients.pop(cname, None)
+            out.append(f"{cname}: ERROR({e})")
+
+    return "\n".join(out)
+
+def execute_cmd(cmd, node, devID):
+    node_l = node.lower()
+    if node_l == server_name:
+        return local_execute(cmd, int(devID))
+    return forward_to_client(node_l, f"{cmd} {devID}")
+
+def merged_devices_with_states():
+    result = []
+    merged = merge_lists(server_name)
+    for line in merged.splitlines():
+        if ":" not in line:
+            continue
+        node, rest = line.split(":", 1)
+        node = node.strip()
+        rest = rest.strip()
+        devID = extract_first_int(rest)
+        if devID is None:
+            continue
+        # Get state for color
+        state = execute_cmd("state", node, devID)
+        color = get_status_color(state)
+        result.append((node, rest, devID, color))
+    return result
+
+# ========================================
+# TCP AGENT ACCEPT LOOP
+# ========================================
+def accept_loop(server_sock):
+    while True:
+        conn, addr = server_sock.accept()
+        try:
+            hello = conn.recv(1024).decode(errors="ignore").strip()
+        except Exception:
+            conn.close()
+            continue
+
+        if not hello.startswith("HELLO "):
+            conn.close()
+            continue
+
+        cname = hello.split(maxsplit=1)[1].strip().lower()
+        conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+
+        with connected_lock:
+            if cname in connected_clients:
+                try:
+                    connected_clients[cname][0].close()
+                except:
+                    pass
+            connected_clients[cname] = (conn, addr)
+
+        log_event(f"Client connected: {cname} at {addr[0]}:{addr[1]}")
+
+# ========================================
+# WEB UI
+# ========================================
+class WebHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        path = (self.path or "/").split("?", 1)[0]
+
+        if path == "/":
+            self.send_html(ui_main_page()); return
+
+        if path == "/listall":
+            txt = merge_lists(server_name)
+            self.send_text(txt); return
+
+        if path == "/log":
+            self.send_html(ui_event_log_page()); return
+
+        # Actions: /toggle/<node>/<dev>, /turnon/<node>/<dev>, /turnoff/<node>/<dev>
+        m = re.match(r"^/(toggle|turnon|turnoff)/([^/]+)/([^/]+)$", path)
+        if m:
+            action = m.group(1)
+            node = unquote(m.group(2))
+            dev = unquote(m.group(3))
+
+            result = execute_cmd(action, node, dev)
+            log_event(f"WEB: {action} {node}:{dev} → {result}")
+
+            # After executing the action, redirect back to the dashboard
+            self.send_response(302)
+            self.send_header("Location", "/")
+            self.end_headers()
+            return
+
+        self.send_error(404, "Not Found")
+
+    # ---- Helpers ----
+    def send_text(self, txt):
+        data = (txt or "").encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def send_html(self, html):
+        data = (html or "").encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+# ========================================
+# UI HTML PAGES (auto-refresh, status colors, log panel)
+# ========================================
+def ui_main_page():
+    devices = merged_devices_with_states()
+
+    html = """
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Cleware Dashboard</title>
+<meta http-equiv="refresh" content="20">
+<style>
+body { font-family: Segoe UI, Arial, sans-serif; margin: 0; padding: 0; display: flex; }
+.container { display: flex; width: 100%; }
+.main { flex: 1; padding: 16px; }
+h2 { margin: 16px 0; }
+table { border-collapse: collapse; width: 100%; max-width: 1100px; }
+th, td { padding: 8px; border: 1px solid #ddd; }
+th { background: #f5f5f5; }
+tr:nth-child(even) { background: #fafafa; }
+.actions a.btn {
+    display: inline-block; padding: 4px 8px; margin-right: 6px;
+    border: 1px solid #aaa; border-radius: 4px;
+    background: #eee; color: #000; text-decoration: none;
+}
+.actions a.btn:hover { background: #ddd; }
+#logbox {
+    width: 36%; max-width: 520px; height: 100vh; overflow-y: auto;
+    border-left: 3px solid #aaa; padding: 16px; background: #fafafa;
+}
+.topbar a { margin-right: 12px; text-decoration: none; }
+.topbar a:hover { text-decoration: underline; }
+.mono { font-family: Consolas, Monaco, monospace; }
+</style>
+</head>
+<body>
+<div class="container">
+  <div class="main">
+    <div class="topbar">
+      <h2>Cleware Network Control</h2>
+      <div>
+        <span class="mono"><b>Server:</b> """ + server_name + """</span>&nbsp;&nbsp;
+        <a href="/">Refresh</a>
+        <a href="/listall">Raw list</a>
+        <a href="/log">Open log page</a>
+      </div>
+    </div>
+    <table>
+      <tr><th>Node</th><th>Device</th><th>Status</th><th>Actions</th></tr>
+"""
+    for node, desc, devID, color in devices:
+        html += (
+            "<tr>"
+            f"<td>{node}</td>"
+            f"<td>{desc}</td>"
+            f"<td>{color}</td>"
+            "<td class='actions'>"
+            f"<a class='btn' href=\"/toggle/{node}/{devID}\">Toggle</a>"
+            f"<a class='btn' href=\"/turnon/{node}/{devID}\">On</a>"
+            f"<a class='btn' href=\"/turnoff/{node}/{devID}\">Off</a>"
+            "</td>"
+            "</tr>"
+        )
+
+    html += """
+    </table>
+  </div>
+
+  <div id="logbox">
+    <h3>Event Log</h3>
+    <pre class="mono">
+"""
+    with event_log_lock:
+        for entry in event_log[-200:]:
+            html += entry + "\n"
+
+    html += """
+    </pre>
+  </div>
+</div>
+</body>
+</html>
+"""
+    return html
+
+def ui_event_log_page():
+    html = "<html><head><meta charset='utf-8'><title>Event Log</title></head><body><h1>Event Log</h1><pre>"
+    with event_log_lock:
+        for entry in event_log:
+            html += entry + "\n"
+    html += "</pre></body></html>"
+    return html
+
+# ========================================
+# CONSOLE HELP
+# ========================================
+def send_help() -> str:
+    return (
+        "Available Commands:\n"
+        "  help                     : show this help\n"
+        "  clients                  : list connected clients\n"
+        "  listall                  : list devices from server + all clients\n"
+        "  state  <node:devID>      : get device state\n"
+        "  turnon <node:devID>      : turn ON device\n"
+        "  turnoff <node:devID>     : turn OFF device\n"
+        "  toggle <node:devID>      : toggle device\n"
+        "  exit                     : quit server\n"
+    )
+
+# ========================================
+# START WEB SERVER
+# ========================================
+def start_web_server():
+    httpd = HTTPServer(("0.0.0.0", WEB_PORT), WebHandler)
+    print(f"[WEB] UI available on http://<SERVER_IP>:{WEB_PORT}")
+    httpd.serve_forever()
+
+# ========================================
+# MAIN
+# ========================================
+def main():
+    global server_name
+    server_name = socket.gethostname().lower()
+
+    tHost, iPort, _ = cwUSB_getConfig()
+    print(f"[SERVER] Agent host configured as {tHost}:{iPort} (server name: {server_name})")
+
+    # TCP server for USB agents
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.bind((tHost, iPort))
+    except OSError as e:
+        if getattr(e, "winerror", None) == 10049:
+            print(f"[SERVER] Configured host '{tHost}' is not local; binding to 0.0.0.0:{iPort}")
+            s.bind(("", iPort))
+        else:
+            print(f"[SERVER] Bind failed on {tHost}:{iPort}, falling back to 0.0.0.0:{iPort} ({e})")
+            s.bind(("", iPort))
+
+    s.listen(50)
+    ip, prt = s.getsockname()[0], s.getsockname()[1]
+    print(f"[SERVER] Agent TCP listening on {ip}:{prt}")
+
+    # Start TCP accept loop for USB agents
+    threading.Thread(target=accept_loop, args=(s,), daemon=True).start()
+    # Start Web UI
+    threading.Thread(target=start_web_server, daemon=True).start()
+
+    print(f"[INFO] Web UI on http://<SERVER_IP>:{WEB_PORT}")
+    print(f"[INFO] Type 'help' for console commands.\n")
+
+    # Console loop
     while True:
         try:
-            if bLocal == False:
-                bEcho = False
-                is_http = False
-                # Receive data from the client
-                data = conn.recv(4096)
-                if not data:
-                    break  # If no data, connection closed
-                command = data.decode(errors='ignore').strip()
-                # detect simple HTTP request (browser)
-                first_line = command.splitlines()[0] if command else ''
-                if first_line.startswith('GET ') or 'HTTP/' in first_line:
-                    is_http = True
-                    parts = first_line.split()
-                    path = parts[1] if len(parts) > 1 else '/'
-                    path = path.split('?', 1)[0]
-                    if path.startswith('/'):
-                        path = path[1:]
-                    # map URL path to command tokens: /list -> "list", /state/123 -> "state 123"
-                    command = path.replace('/', ' ').strip()
-                    if command == '':
-                        command = 'help'
-                print(f"Received command: {command}")
+            cmd_line = input("server> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nExiting.")
+            break
+
+        if not cmd_line:
+            continue
+
+        low = cmd_line.lower()
+        if low == "help":
+            print(send_help()); continue
+
+        if low == "clients":
+            with connected_lock:
+                if connected_clients:
+                    for name, (sock, addr) in connected_clients.items():
+                        print(f"{name}  ({addr[0]}:{addr[1]})")
+                else:
+                    print("(no clients connected)")
+            continue
+
+        if low == "listall":
+            print(merge_lists(server_name)); continue
+
+        if any(low.startswith(pfx) for pfx in ("state ", "turnon ", "turnoff ", "toggle ")):
+            parts = cmd_line.split()
+            if len(parts) != 2 or ":" not in parts[1]:
+                print("Usage: state <node:devID>  (example: state pc1:0)")
+                continue
+
+            node, dev = parts[1].split(":", 1)
+            try:
+                dev_int = int(dev)
+            except Exception:
+                print("ERROR: devID must be an integer")
+                continue
+
+            verb = parts[0].lower()
+            if node.lower() == server_name:
+                print(local_execute(verb, dev_int))
             else:
-                command = tLocalCommand
-                bEcho   = True
-                is_http = False
-    
-            response = ""  # Initialize response to avoid UnboundLocalError
+                print(forward_to_client(node, f"{verb} {dev_int}"))
+            continue
 
-            # Use a configurable or relative DLL path for better portability
-            dll_path = os.environ.get("CLEWARE_DLL_PATH", os.path.join(os.path.dirname(__file__), "Source", "USBaccessX64.dll"))
-            mydll = windll.LoadLibrary(dll_path)
+        if low == "exit":
+            break
 
-            cw = mydll.FCWInitObject()
-            devCnt = mydll.FCWOpenCleware(0)
-            if devCnt == 0:
-                print("No devices found.")
-                return
-            else: 
-                print("Device count = ", devCnt)
-                print(cwUSB_list_Devices() + "\n")
-                if bLocal:
-                    print("What do you want to do?")
-                    command = input()
-                    if command == '':
-                        command = 'help'
-                        print(f"Received command: {command}\n" + send_help())
-                else:
-                    if command == '':
-                        command = 'help'
-                        print(f"Received command: {command}\n" + send_help())
-                parts = command.split()
-                cmd = parts[0].lower()
+        print("Unknown command. Type 'help'.")
 
-                if cmd == 'help':
-                    #print(send_help())
-                    response = send_help()
-                elif cmd == 'list':
-                    response = cwUSB_list_Devices() + "\n"
-                elif cmd in ('state', 'turnon', 'turnoff', 'toggle', 'rename'):
-                    if len(parts) < 2:
-                        response = f"Usage: {cmd} <devID> {'<new name>' if cmd=='rename' else ''}"
-                    else:
-                        try:
-                            devID = int(parts[1])
-                        except ValueError:
-                            print("devID must be an integer")
-                        else:
-                            if cmd == 'state':
-                                #print(f"Current state of device {devID}: {cwUSB_get_StateFromNum(devID)}")
-                                response = f"Current state of device {devID}: {cwUSB_get_StateFromNum(devID)}"
-                            elif cmd == 'turnon':
-                                cwUSB_set_StateToNum(devID, 1)
-                                iState = cwUSB_get_StateFromNum(devID)
-                                print(f"Turned ON device {devID} - new state: {cwUSB_get_StateStr(iState)}")
-                                response = f"Turned ON device {devID} - new state: {cwUSB_get_StateStr(iState)}"
-                            elif cmd == 'turnoff':
-                                cwUSB_set_StateToNum(devID, 0)
-                                iState = cwUSB_get_StateFromNum(devID)
-                                print(f"Turned OFF device {devID} - new state: {cwUSB_get_StateStr(iState)}")
-                                response = f"Turned OFF device {devID} - new state: {cwUSB_get_StateStr(iState)}"
-                            elif cmd == 'toggle':
-                                try:
-                                    cur = cwUSB_get_StateFromNum(devID)
-                                    cwUSB_set_StateToNum(devID, 0 if cur else 1)
-                                    print(f"Toggled device {devID} - new state: {cwUSB_get_StateStr(cwUSB_get_StateFromNum(devID))}")
-                                    response = f"Toggled device {devID} - new state: {cwUSB_get_StateStr(cwUSB_get_StateFromNum(devID))}"
-                                except Exception as e:
-                                    print("Toggle failed:", e)
-                                    response = "Toggle failed"
-                            elif cmd == 'rename':
-                                if len(parts) < 3:
-                                    response = "Usage: rename <devID> <new name>"
-                                else:
-                                    newName = " ".join(parts[2:])
-                                    # if the DLL expects bytes, encode: mydll.FCWRenameDevice(devID, newName.encode('utf-8'))
-                                    try:
-                                        #mydll.FCWRenameDevice(devID, newName)
-                                        cwUSB_set_NametoNum(devID, newName)
-                                        print(f"Renamed device {devID} to {newName}")
-                                        response = f"Renamed device {devID} to {newName}"
-                                    except Exception as e:
-                                        print("Rename failed:", e)
-                                        response = "Rename failed"
-                elif cmd == 'exit':
-                    quit = True
-                    #break
-                            
-                else:
-                    print(f"Unknown command: {command}")
-                    response = "Unknown command"
-
-
-
-             # Send response back to client
-            if len(response) == 0:
-                response = "no response"
-            if bEcho:
-                print("Response:")
-                print(response)
-            if bLocal == False:
-                if is_http:
-                    body = response + "\n"
-                    http = "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\n\r\n{}".format(len(body.encode('utf-8')), body)
-                    conn.sendall(http.encode('utf-8'))
-                else:
-                    conn.sendall(response.encode('utf-8'))
-            else:
-                break  # exit loop
-
-        except Exception as e:
-            print(f"Error handling client: {e}")
-            break       
-
-    if bLocal == False:
-        conn.close() 
-
-
-
-def main():
-    
-    iNoOfArg = len(sys.argv) - 1
-    bLocal = iNoOfArg > 0
-    
-    if bLocal == False:
-        print("Startup:")
-        [tHost, iPort, tDll] = cwUSB_getConfig()
-        print(f"Try to start Server on {tHost}:{iPort}")
-
-        try:
-            # Create a socket object
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                # Bind the socket to the address and port
-                try:
-                    s.bind((tHost, iPort))
-                except OSError as e:
-                    # WinError 10049: The requested address is not valid in its context
-                    if getattr(e, "winerror", None) == 10049:
-                        print(f"Configured host '{tHost}' is not local; binding to all interfaces (0.0.0.0:{iPort}) instead")
-                        s.bind(("", iPort))  # bind to all interfaces
-                    else:
-                        raise
-
-                # Listen for incoming connections (max 5 in queue)
-                s.listen(5)
-                print(f"Server started on {tHost}:{iPort}")
-
-                while True:
-                    # Accept a connection
-                    conn, IPAddr = s.accept()
-                    try:
-                        [tClientName, aliasList, ipAdressList] = socket.gethostbyaddr(IPAddr[0])
-                    except Exception:
-                        tClientName = IPAddr[0]
-
-                    print(f"{tClientName} connected    ({IPAddr[0]}:{IPAddr[1]})")
-
-                    # Handle the client in a separate thread so we can accept more clients
-                    threading.Thread(target=handle_client, args=(conn, ""), daemon=True).start()
-                    # connection will be closed by the handler; do not block here
-
-        except Exception as e:
-            print(f"Error starting server: {e}")
-    else:
-        if 0 < iNoOfArg:
-            command = ""
-        for i in range(1, iNoOfArg+1):
-            command += sys.argv[i] + " "
-        handle_client(None, command)
+    # Cleanup
+    with connected_lock:
+        for sock, _ in connected_clients.values():
+            try:
+                sock.close()
+            except Exception:
+                pass
+        connected_clients.clear()
 
 if __name__ == "__main__":
     main()
-

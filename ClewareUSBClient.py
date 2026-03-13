@@ -1,64 +1,108 @@
-# Cleware USB Switch Client
-# to be executed on the client, that wants to control the Cleware USB Switches
-# on the POWER_MANAGEMENT computer (currently EH39M31C)
-# called without parameter we go into interactive mode
-# all commands listed there can be passed to the Client console application.
-# the command will be executed immediately and the application terminates
-#
-# Configuration can be done in an unnamed section in
-# ClewareUSB.ini:
-#   host = EH39M31C.ad005.onehc.net
-#   port = 59001
-#   dll  = USBaccessX64.dll
-#
-# executable was generated with 
-# pyinstaller --noconfirm --onefile --console --icon "E:\PythonProjects\ClewareUSBClientServer\ClewareUSBClient.ico"  --name "ClewareUSBClient" "E:\PythonProjects\ClewareUSBClientServer\ClewareUSBClient.py"
-
+# client.py (USB agent that controls local Cleware USB and talks to the server)
 import socket
 import sys
-import getopt
-from ClewareUSBLib import cwUSB_getConfig
+import os
+import time
+from ctypes import windll
+from ClewareUSBLib import cwUSB_getConfig, cwUSB_list_Devices, cwUSB_get_StateFromNum, cwUSB_set_StateToNum
 
-def main():
+RECONNECT_BASE_DELAY = 2
+RECONNECT_MAX_DELAY = 30
 
-    iNoOfArg = len(sys.argv) - 1
+def handle_command(command: str) -> str:
+    """Execute a single hardware command locally and return a string response."""
+    dll_path = os.environ.get(
+        "CLEWARE_DLL_PATH",
+        os.path.join(os.path.dirname(__file__), "Source", "USBaccessX64.dll")
+    )
+    mydll = windll.LoadLibrary(dll_path)
+    mydll.FCWInitObject()
+    devCnt = mydll.FCWOpenCleware(0)
 
-    [tHost, iPort, tDll] = cwUSB_getConfig()
+    parts = (command or "").strip().split()
+    if not parts:
+        return "ERROR: EMPTY_CMD"
 
-    print ("Connecting to " + tHost + ":" + str(iPort))
+    cmd = parts[0].lower()
+
+    if cmd == "list":
+        # Note: return an empty string if no devices, so the server can still mark the node online
+        return cwUSB_list_Devices() if devCnt > 0 else ""
+
+    if devCnt == 0:
+        return "NO_DEVICES"
+
+    if len(parts) < 2:
+        return "ERROR: Missing devID"
+
     try:
-        # Create a socket object
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            # Connect to the server
-            s.connect((tHost, iPort))
-            print(f"Connected to {tHost}:{iPort}")
+        devID = int(parts[1])
+    except Exception:
+        return "ERROR: devID must be int"
 
-            if 0 < iNoOfArg:
-                command = ""
-                for i in range(1, iNoOfArg+1):
-                    command += sys.argv[i] + " "
-            else:
-                command = "help" # interactive mode. get list of commands first
+    if cmd == "state":
+        return f"{cwUSB_get_StateFromNum(devID)}"
 
-            while True:
-                command = command.strip()
-                if command.lower() == "exit":
-                    break
-                if len(command) > 0: 
-                    # Send the command to the server
-                    s.sendall(command.encode())
+    if cmd == "turnon":
+        cwUSB_set_StateToNum(devID, 1)
+        return "OK"
 
-                    # Receive response from the server
-                    data = s.recv(10240)
-                    print(f"Server response:\n{data.decode()}")
+    if cmd == "turnoff":
+        cwUSB_set_StateToNum(devID, 0)
+        return "OK"
 
-                if 0 < iNoOfArg:
-                    break
-                else: # interactive mode
-                    command = input("Enter command (or 'exit' to quit): ")
+    if cmd == "toggle":
+        cur = cwUSB_get_StateFromNum(devID)
+        cwUSB_set_StateToNum(devID, 0 if cur else 1)
+        return "OK"
 
-    except Exception as e:
-        print(f"Error connecting to server: {e}")
+    return "ERROR: UNKNOWN_CMD"
+
+
+def run_agent():
+    # Read server host/port from your existing config
+    host, port, _ = cwUSB_getConfig()
+    hostname = socket.gethostname()
+    print(f"[CLIENT] Will connect to server at {host}:{port} as {hostname}")
+
+    delay = RECONNECT_BASE_DELAY
+    while True:
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                s.connect((host, port))
+                # Introduce ourselves (lowercased name will be stored server-side)
+                s.sendall(f"HELLO {hostname}".encode("utf-8"))
+                print("[CLIENT] Connected. Waiting for commands...")
+
+                while True:
+                    data = s.recv(4096)
+                    if not data:
+                        print("[CLIENT] Server closed connection.")
+                        break
+
+                    command = data.decode(errors="ignore").strip()
+                    if not command:
+                        s.sendall(b"ERROR: EMPTY_CMD")
+                        continue
+
+                    try:
+                        resp = handle_command(command)
+                    except Exception as e:
+                        resp = f"ERROR: {e}"
+
+                    s.sendall(resp.encode("utf-8"))
+
+            # Disconnected: try to reconnect with backoff
+            print(f"[CLIENT] Disconnected. Reconnecting in {delay}s ...")
+            time.sleep(delay)
+            delay = min(RECONNECT_MAX_DELAY, delay * 2)
+
+        except Exception as e:
+            print(f"[CLIENT] Connect error: {e}. Retrying in {delay}s ...")
+            time.sleep(delay)
+            delay = min(RECONNECT_MAX_DELAY, delay * 2)
+
 
 if __name__ == "__main__":
-    main()
+    run_agent()
