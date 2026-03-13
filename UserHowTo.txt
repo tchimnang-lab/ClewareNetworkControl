@@ -1,0 +1,22 @@
+Bedienung:
+1- In 'ClewareUSBLib.py' Linien 22 und 23 Host und Port anpassen:
+	tHost = Netz-/IP Adresse des Servers z.B.: 'EH39M31C.ad005.onehc.net' / '127.0.0.1'
+  	iPort = 59001
+2- 'ClewareUSBServer' auf PowerPC starten
+3- 'ClewareUSBClient' auf Clients mit USB Switches starten
+4- Anwendung im Browser öffnen (Server): <Netzadresse des Servers>:8080 z.B.: EH39M31C.ad005.onehc.net:8080
+
+
+Commandline Bedienung (auf Server):
+
+	Available Commands:
+        	help                     : show this help
+        	clients                  : list connected clients
+        	listall                  : list devices from server + all clients
+        	state  <node:devID>      : get device state
+        	turnon <node:devID>      : turn ON device
+        	turnoff <node:devID>     : turn OFF device
+        	toggle <node:devID>      : toggle device
+        	exit                     : quit server
+
+	Z.B.: turnon EH39M31C:0 -> turns on device 0 (1st device) on server/client with name EH39M31C.
