@@ -1,0 +1,24 @@
+Bedienung:
+1- In 'ClewareUSB.ini' Host und Port anpassen:
+	Host = Netz-/IP Adresse des Servers z.B.: 'EH39M31C.ad005.onehc.net' oder '127.0.0.1'
+  	Port = 59001
+!!!'ClewareUSB.ini' im Server Ordner muss dem 'ClewareUSB.ini' im Client Ordner entsprechen. Am besten copy/paste nach Änderung.
+
+2- 'ClewareUSBServer' auf PowerPC starten
+3- 'ClewareUSBClient' auf Clients mit USB Switches starten
+4- Anwendung im Browser öffnen (Server): <Netzadresse des Servers>:8080 -->z.B.: EH39M31C.ad005.onehc.net:8080
+
+
+Kommandozeile Bedienung (auf Server):
+
+	Available Commands:
+        	help                     : show this help
+        	clients                  : list connected clients
+        	listall                  : list devices from server + all clients
+        	state  <node:devID>      : get device state
+        	turnon <node:devID>      : turn ON device
+        	turnoff <node:devID>     : turn OFF device
+        	toggle <node:devID>      : toggle device
+        	exit                     : quit server
+
+	Z.B.: turnon EH39M31C:0 -> schaltet Gerät 0 (1. Switch) auf server/client mit Namen EH39M31C an.
