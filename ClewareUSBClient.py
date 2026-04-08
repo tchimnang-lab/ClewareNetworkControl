@@ -4,7 +4,7 @@ import sys
 import os
 import time
 from ctypes import windll
-from ClewareUSBLib import cwUSB_getConfig, cwUSB_list_Devices, cwUSB_get_StateFromNum, cwUSB_set_StateToNum
+from ClewareUSBLib import cwUSB_getConfig, cwUSB_list_Devices, cwUSB_get_StateFromNum, cwUSB_set_NametoNum, cwUSB_set_StateToNum
 
 RECONNECT_BASE_DELAY = 2
 RECONNECT_MAX_DELAY = 30
@@ -55,6 +55,16 @@ def handle_command(command: str) -> str:
         cur = cwUSB_get_StateFromNum(devID)
         cwUSB_set_StateToNum(devID, 0 if cur else 1)
         return "OK"
+    
+    elif cmd == "rename":
+        if len(parts) < 3:
+            return "ERROR: Missing newName"
+        newName = " ".join(parts[2:])
+        try:
+            cwUSB_set_NametoNum(devID, newName)
+            return "OK"
+        except Exception as e:
+            return f"ERROR: rename failed ({e})"
 
     return "ERROR: UNKNOWN_CMD"
 

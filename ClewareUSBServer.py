@@ -1,504 +1,543 @@
-# ============================================================
-#  SERVER WITH WEB UI (STATUS COLORS, AUTO REFRESH, EVENT LOG)
-# ============================================================
 
 import socket
 import threading
-import sys
+import time
 import os
 import re
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from urllib.parse import unquote
-from ctypes import windll
-from typing import Dict, Tuple
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import unquote, parse_qs
+from queue import Queue
+from typing import Dict, Tuple, List
 from datetime import datetime
+from urllib.parse import parse_qs, urlparse
+from ClewareUSBLib import *
+from ctypes import windll
 
-# Cleware helpers (must be available in your environment)
-from ClewareUSBLib import (
-    cwUSB_getConfig,
-    cwUSB_list_Devices,
-    cwUSB_get_StateFromNum,
-    cwUSB_set_StateToNum,
-)
+# ===================== CONFIG =====================
+SOCKET_TIMEOUT = 5
+STATE_POLL_INTERVAL = 20
+WEB_PORT = int(os.environ.get("CLEWARE_WEB_PORT", "8080"))
+MAX_USB_QUEUE = 100
 
-# ========================================
-# GLOBALS
-# ========================================
+WATCHDOG_DEVICE     = 0x05
+AUTORESET_DEVICE    = 0x06
+WATCHDOGXP_DEVICE   = 0x07
+# ===================== GLOBALS =====================
 connected_clients: Dict[str, Tuple[socket.socket, Tuple[str, int]]] = {}
 connected_lock = threading.Lock()
 
-event_log = []
-event_log_lock = threading.Lock()
-MAX_LOG_ENTRIES = 300
+STATE_CACHE: Dict[Tuple[str, int], str] = {}
+STATE_CACHE_LOCK = threading.Lock()
+
+DEVICE_NAME_CACHE: Dict[Tuple[str, int], str] = {}
+
+USB_QUEUE: Queue = Queue()
 
 server_name = None
-WEB_PORT = int(os.environ.get("CLEWARE_WEB_PORT", "8080"))
 
-# ========================================
-# EVENT LOGGING
-# ========================================
+# USB health & recovery
+USB_RECOVERY_LOCK = threading.Lock()
+USB_HEALTH_ERRORS = 0
+USB_HEALTH_THRESHOLD = 3
+LAST_USB_RECOVERY = 0
+USB_RECOVERY_INTERVAL = 180  # seconds (3 minutes)
+USB_START_TIME = time.time()
+USB_MAX_UPTIME = 600          # 10 minutes before forced device reset
+PANIC_WATCHDOG = False
+
+#Escalation counters
+USB_RECOVERY_COUNT = 0
+USB_RESET_COUNT = 0
+USB_MAX_RECOVERIES = 3
+MAX_DEVICE_RESETS = 2
+# ===================== LOGGING =====================
 def log_event(msg: str):
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    entry = f"[{timestamp}] {msg}"
-    print(entry)
-    with event_log_lock:
-        event_log.append(entry)
-        if len(event_log) > MAX_LOG_ENTRIES:
-            event_log.pop(0)
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
 
-# ========================================
-# LOCAL USB HELPERS
-# ========================================
+# ===================== DLL =====================
+DLL_HANDLE = None
+
 def load_local_dll():
-    dll_path = os.environ.get(
-        "CLEWARE_DLL_PATH",
-        os.path.join(os.path.dirname(__file__), "Source", "USBaccessX64.dll"),
-    )
-    return windll.LoadLibrary(dll_path)
+    global DLL_HANDLE
+    if DLL_HANDLE:
+        return DLL_HANDLE
 
-def list_local_devices():
-    try:
-        dll = load_local_dll()
-        dll.FCWInitObject()
-        devCnt = dll.FCWOpenCleware(0)
-        return cwUSB_list_Devices() if devCnt > 0 else ""
-    except Exception as e:
-        return f"ERROR:LOCAL_DEVICES({e})"
+    path = os.path.join(os.path.dirname(__file__), "Source", "USBaccessX64.dll")
+    DLL_HANDLE = windll.LoadLibrary(path)
+    return DLL_HANDLE
 
-def local_execute(cmd, devID):
-    try:
-        dll = load_local_dll()
-        dll.FCWInitObject()
-        devCnt = dll.FCWOpenCleware(0)
-        if devCnt == 0:
-            return "NO_LOCAL_DEVICES"
+# ===================== USB WORKER =====================
+class USBCommand:
+    def __init__(self, cmd, devID=None, extra=None):
+        self.cmd = cmd
+        self.devID = devID
+        self.extra = extra
+        self.result = None
+        self.event = threading.Event()
 
-        if cmd == "state":
-            return f"{cwUSB_get_StateFromNum(devID)}"
 
-        if cmd == "turnon":
-            cwUSB_set_StateToNum(devID, 1)
-            log_event(f"{server_name.upper()}: Turned ON device {devID}")
-            return "OK"
+def usb_worker():
+    dll = load_local_dll()
+    dll.FCWInitObject()
+    dll.FCWOpenCleware(0)
 
-        if cmd == "turnoff":
-            cwUSB_set_StateToNum(devID, 0)
-            log_event(f"{server_name.upper()}: Turned OFF device {devID}")
-            return "OK"
+    while True:
+        job: USBCommand = USB_QUEUE.get()
 
-        if cmd == "toggle":
-            cur = cwUSB_get_StateFromNum(devID)
-            cwUSB_set_StateToNum(devID, 0 if cur else 1)
-            log_event(f"{server_name.upper()}: Toggled device {devID}")
-            return "OK"
-
-        return "UNKNOWN_LOCAL_CMD"
-
-    except Exception as e:
-        return f"ERROR:{e}"
-
-# ========================================
-# CLIENT FORWARDING
-# ========================================
-def forward_to_client(client_name, command):
-    cname = client_name.lower()
-    with connected_lock:
-        entry = connected_clients.get(cname)
-
-    if not entry:
-        return "ERROR: CLIENT_NOT_CONNECTED"
-
-    sock, _ = entry
-    try:
-        sock.sendall(command.encode("utf-8"))
-        reply = sock.recv(65536)
-
-        if not reply:
-            with connected_lock:
-                connected_clients.pop(cname, None)
-            return "ERROR:CLIENT_DISCONNECTED"
-
-        reply_txt = reply.decode(errors="ignore").strip()
-
-        # Log actions (not logging 'state' to reduce noise)
-        if command.startswith("turn") or command.startswith("toggle"):
-            log_event(f"{cname.upper()}: Executed '{command}', result={reply_txt}")
-
-        return reply_txt
-
-    except Exception as e:
-        with connected_lock:
-            connected_clients.pop(cname, None)
-        return f"ERROR:COMM_FAIL({e})"
-
-# ========================================
-# MERGED LIST + STATUS COLORS
-# ========================================
-def extract_first_int(text):
-    m = re.search(r"\d+", text)
-    return m.group(0) if m else None
-
-def get_status_color(state_str):
-    try:
-        state = int(state_str)
-        if state == 1:
-            return "<span style='color:green;font-weight:bold'>ON</span>"
-        elif state == 0:
-            return "<span style='color:red;font-weight:bold'>OFF</span>"
-    except:
-        pass
-    return "<span style='color:gray'>?</span>"
-
-def merge_lists(server_node):
-    out = []
-
-    # SERVER devices
-    local = list_local_devices()
-    if local.strip():
-        for line in local.splitlines():
-            if line.strip():
-                out.append(f"{server_node}:{line}")
-    elif local.startswith("ERROR:"):
-        out.append(f"{server_node}:{local}")
-
-    # CLIENT devices
-    with connected_lock:
-        items = list(connected_clients.items())
-
-    for cname, (sock, addr) in items:
         try:
-            sock.sendall(b"list")
-            txt = sock.recv(65536).decode(errors="ignore").strip()
+            if job.cmd == "list":
+                job.result = cwUSB_list_Devices()
+
+            elif job.cmd == "state":
+                job.result = str(cwUSB_get_StateFromNum(job.devID))
+
+            elif job.cmd == "set":
+                cwUSB_set_StateToNum(job.devID, job.extra)
+                job.result = "OK"
+
+            elif job.cmd == "rename":
+                cwUSB_set_NametoNum(job.devID, job.extra)
+                job.result = "OK"
+
+        except Exception as e:
+            job.result = f"ERROR:{e}"
+
+        job.event.set()
+
+threading.Thread(target=usb_worker, daemon=True).start()
+
+def usb_execute(cmd, devID=None, extra=None):
+    if USB_QUEUE.qsize() > MAX_USB_QUEUE:
+        return "BUSY"
+
+    job = USBCommand(cmd, devID, extra)
+    USB_QUEUE.put(job)
+    job.event.wait(timeout=5)
+    return job.result
+
+# Full USB recovery
+
+def usb_escalating_recover(devID=None, reason="unknown"):
+    global USB_RECOVERY_COUNT, LAST_USB_RECOVERY, USB_START_TIME, PANIC_WATCHDOG
+
+    with USB_RECOVERY_LOCK:
+        USB_RECOVERY_COUNT += 1
+        log_event(f"[USB] Escalation #{USB_RECOVERY_COUNT} — reason: {reason}")
+
+        # ---------- LEVEL 1: full USB re-enumeration ----------
+        try:
+            cwUSB_cleanup()
+        except:
+            pass
+
+        time.sleep(1)
+
+        try:
+            cwUSB_setup()
+            LAST_USB_RECOVERY = time.time()
+            log_event("[USB] Re-enumeration successful")
+        except Exception as e:
+            log_event(f"[USB] Re-enumeration failed: {e}")
+
+        # ---------- LEVEL 3: time-based device reset ----------
+        uptime = time.time() - USB_START_TIME
+        if uptime > USB_MAX_UPTIME:
+            log_event("[USB] Max USB uptime exceeded — resetting devices")
+
+            txt = usb_execute("list")
             if txt:
                 for line in txt.splitlines():
-                    if line.strip():
-                        out.append(f"{cname}:{line}")
-        except Exception as e:
-            # Drop dead client and show error row
-            with connected_lock:
-                connected_clients.pop(cname, None)
-            out.append(f"{cname}: ERROR({e})")
+                    dev = extract_dev(line)
+                    if dev is not None:
+                        try:
+                            cwUSB_ResetDevice(dev)
+                            log_event(f"[USB] Device {dev} reset")
+                        except:
+                            pass
 
-    return "\n".join(out)
+            USB_START_TIME = time.time()
+            USB_RECOVERY_COUNT = 0
+            time.sleep(5)
+            return
 
-def execute_cmd(cmd, node, devID):
-    node_l = node.lower()
-    if node_l == server_name:
-        return local_execute(cmd, int(devID))
-    return forward_to_client(node_l, f"{cmd} {devID}")
+        # ---------- LEVEL 4: panic watchdog ----------
+        if USB_RECOVERY_COUNT >= USB_MAX_RECOVERIES:
+            log_event("[USB] PANIC: unrecoverable USB failure — triggering watchdog reboot")
+            PANIC_WATCHDOG = True
 
-def merged_devices_with_states():
-    result = []
-    merged = merge_lists(server_name)
-    for line in merged.splitlines():
-        if ":" not in line:
-            continue
-        node, rest = line.split(":", 1)
-        node = node.strip()
-        rest = rest.strip()
-        devID = extract_first_int(rest)
-        if devID is None:
-            continue
-        # Get state for color
-        state = execute_cmd("state", node, devID)
-        color = get_status_color(state)
-        result.append((node, rest, devID, color))
-    return result
+# ===================== TCP =====================
+def send_msg(sock, msg):
+    sock.sendall((msg + "\n").encode())
 
-# ========================================
-# TCP AGENT ACCEPT LOOP
-# ========================================
-def accept_loop(server_sock):
+
+def recv_msg(sock):
+    buffer = ""
     while True:
-        conn, addr = server_sock.accept()
-        try:
-            hello = conn.recv(1024).decode(errors="ignore").strip()
-        except Exception:
-            conn.close()
-            continue
+        data = sock.recv(1024).decode()
+        if not data:
+            return None
+        buffer += data
+        if "\n" in buffer:
+            msg, _ = buffer.split("\n", 1)
+            return msg.strip()
 
-        if not hello.startswith("HELLO "):
-            conn.close()
-            continue
 
-        cname = hello.split(maxsplit=1)[1].strip().lower()
-        conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+def rpc_call(sock, msg):
+    try:
+        send_msg(sock, msg)
+        return recv_msg(sock)
+    except:
+        return None
 
+# ===================== STATE LOOP =====================
+def extract_dev(line):
+    m = re.search(r"serial number=\s*(\d+)", line)
+    return int(m.group(1)) if m else None
+
+
+def extract_name(line):
+    m = re.search(r"Name=(.*)$", line)
+    return m.group(1).strip() if m else ""
+
+
+def state_loop():
+    global USB_HEALTH_ERRORS
+    global LAST_USB_RECOVERY
+
+    while True:
+        cycle_ok = True
+        last_bad_dev = None
+
+        txt = usb_execute("list")
+
+        if not txt:
+            cycle_ok = False
+        else:
+            lines = [l.strip() for l in txt.splitlines() if l.strip()]
+            if not lines:
+                cycle_ok = False
+            else:
+                for line in lines:
+                    devID = extract_dev(line)
+                    
+                    if not txt or not lines:
+                        usb_escalating_recover(reason="device list empty")
+
+                    if devID is None:
+                        continue
+
+                    name = extract_name(line)
+                    raw_state = usb_execute("state", devID)
+
+                    if raw_state not in ("0", "1"):
+                        cycle_ok = False
+                        last_bad_dev = devID
+                        break   # stop scanning — failure detected
+
+                    with STATE_CACHE_LOCK:
+                        STATE_CACHE[(server_name, devID)] = raw_state
+                        DEVICE_NAME_CACHE[(server_name, devID)] = name
+
+        # ---- health evaluation (ONCE per cycle) ----
+        if cycle_ok:
+            USB_HEALTH_ERRORS = 0
+        else:
+            USB_HEALTH_ERRORS += 1
+
+        # ---- escalation based on errors ----
+        if USB_HEALTH_ERRORS >= USB_HEALTH_THRESHOLD:
+            log_event("USB health degraded — escalating recovery")
+            usb_escalating_recover(last_bad_dev)
+            USB_HEALTH_ERRORS = 0
+            LAST_USB_RECOVERY = time.time()
+
+        # ---- periodic preventive recovery ----
+        now = time.time()
+        if now - LAST_USB_RECOVERY > USB_RECOVERY_INTERVAL:
+            usb_escalating_recover(reason="periodic refresh")
+            LAST_USB_RECOVERY = now
+
+        # remote nodes via RPC
         with connected_lock:
-            if cname in connected_clients:
+            clients = dict(connected_clients)
+
+        for cname, (sock, _) in clients.items():
+            reply = rpc_call(sock, "state_all")
+            if not reply:
+                continue
+
+            for entry in reply.split(","):
                 try:
-                    connected_clients[cname][0].close()
+                    dev, state, name = entry.split(":")
+                    dev = int(dev)
+
+                    with STATE_CACHE_LOCK:
+                        STATE_CACHE[(cname, dev)] = state.strip()  # raw
+                        DEVICE_NAME_CACHE[(cname, dev)] = name.strip()
+
                 except:
                     pass
-            connected_clients[cname] = (conn, addr)
+    
+        time.sleep(STATE_POLL_INTERVAL)
 
-        log_event(f"Client connected: {cname} at {addr[0]}:{addr[1]}")
+threading.Thread(target=state_loop, daemon=True).start()
 
-# ========================================
-# WEB UI
-# ========================================
-class WebHandler(BaseHTTPRequestHandler):
+# ============== Watchdog loop ==============
+def watchdog_loop():
+    """
+    Feeds watchdog devices unless PANIC_WATCHDOG is set.
+    When panic is active, feeding stops → system reboot.
+    """
+    global PANIC_WATCHDOG
+
+    print("[Watchdog] Started watchdog feeder thread")
+
+    while True:
+        if PANIC_WATCHDOG:
+            log_event("[Watchdog] PANIC MODE — watchdog feeding stopped")
+            while True:
+                time.sleep(1)   # intentionally do nothing
+
+        txt = usb_execute("list")
+        if not txt:
+            time.sleep(1)
+            continue
+
+        for line in txt.splitlines():
+            devID = extract_dev(line)
+            if devID is None:
+                continue
+
+            t = cwUSB_get_USBType(devID)
+
+            try:
+                # WATCHDOG / AUTORESET (minutes)
+                if t in (WATCHDOG_DEVICE, AUTORESET_DEVICE):
+                    cwUSB_CalmWatchdog(devID, 1, 0)
+
+                # WATCHDOG XP (seconds)
+                elif t == WATCHDOGXP_DEVICE:
+                    cwUSB_CalmWatchdog(devID, 1, 0)
+
+            except:
+                pass
+
+        time.sleep(1)
+
+threading.Thread(target=watchdog_loop, daemon=True).start()
+
+# ===================== COMMAND =====================
+def execute_cmd(node, dev, action, extra=None):
+    node = node.lower()
+    dev = int(dev)
+
+    if node == server_name:
+        if action == "toggle":
+            cur = usb_execute("state", dev)
+            new = 0 if cur == "1" else 1
+            return usb_execute("set", dev, new)
+        elif action == "on":
+            return usb_execute("set", dev, 1)
+        elif action == "off":
+            return usb_execute("set", dev, 0)
+        elif action == "rename":
+            return usb_execute("rename", dev, extra)
+
+    with connected_lock:
+        entry = connected_clients.get(node)
+    if not entry:
+        return "NOCLIENT"
+
+    sock, _ = entry
+    return rpc_call(sock, f"{action} {dev} {extra or ''}".strip())
+
+# ===================== WEB =====================
+class Handler(BaseHTTPRequestHandler):
+
     def do_GET(self):
-        path = (self.path or "/").split("?", 1)[0]
+        parsed = urlparse(self.path)
 
-        if path == "/":
-            self.send_html(ui_main_page()); return
+        if parsed.path == "/action":
+            q = parse_qs(parsed.query)
+            node = q.get("node", [""])[0]
+            dev = q.get("dev", [""])[0]
+            cmd = q.get("cmd", [""])[0]
+            name = q.get("name", [""])[0]
 
-        if path == "/listall":
-            txt = merge_lists(server_name)
-            self.send_text(txt); return
+            execute_cmd(node, dev, cmd, name)
+            log_event(f"{cmd} {node}:{dev}")
 
-        if path == "/log":
-            self.send_html(ui_event_log_page()); return
-
-        # Actions: /toggle/<node>/<dev>, /turnon/<node>/<dev>, /turnoff/<node>/<dev>
-        m = re.match(r"^/(toggle|turnon|turnoff)/([^/]+)/([^/]+)$", path)
-        if m:
-            action = m.group(1)
-            node = unquote(m.group(2))
-            dev = unquote(m.group(3))
-
-            result = execute_cmd(action, node, dev)
-            log_event(f"WEB: {action} {node}:{dev} → {result}")
-
-            # After executing the action, redirect back to the dashboard
             self.send_response(302)
             self.send_header("Location", "/")
             self.end_headers()
             return
 
-        self.send_error(404, "Not Found")
+        rows = []
+        with STATE_CACHE_LOCK:
+            for (node, dev), state in STATE_CACHE.items():
+                name = DEVICE_NAME_CACHE.get((node, dev), "")
+                state_txt = "ON" if state == "1" else "OFF" if state == "0" else "?"
+                state_class = "state-on" if state == "1" else "state-off" if state == "0" else "state-unk"
 
-    # ---- Helpers ----
-    def send_text(self, txt):
-        data = (txt or "").encode("utf-8")
-        self.send_response(200)
-        self.send_header("Content-Type", "text/plain; charset=utf-8")
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
+                rows.append(f"""
+                <tr>
+                    <td>{node}</td>
+                    <td>{dev}</td>
+                    <td>{name}</td>
+                    <td class='{state_class}'>{state_txt}</td>
+                    <td>
+                        <a class='btn' href='#' onclick="doAction('{node}','{dev}','on')">On</a>
+                        <a class='btn' href='#' onclick="doAction('{node}','{dev}','off')">Off</a>
+                        <a class='btn' href='#' onclick="doAction('{node}','{dev}','toggle')">Toggle</a>                      
+                        <form style='display:inline' action='/action' onsubmit="renameDevice(event, this)">
+                            <input type='hidden' name='node' value='{node}'>
+                            <input type='hidden' name='dev' value='{dev}'>
+                            <input type='hidden' name='cmd' value='rename'>
+                            <input name='name' placeholder='Rename (press Enter)'>
+                        </form>
+                    </td>
+                </tr>
+                """)
 
-    def send_html(self, html):
-        data = (html or "").encode("utf-8")
-        self.send_response(200)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
-
-# ========================================
-# UI HTML PAGES (auto-refresh, status colors, log panel)
-# ========================================
-def ui_main_page():
-    devices = merged_devices_with_states()
-
-    html = """
-<!doctype html>
+        html = f"""
+<!DOCTYPE html>
 <html>
 <head>
-<meta charset="utf-8">
-<title>Cleware Dashboard</title>
-<meta http-equiv="refresh" content="20">
+<meta charset='UTF-8'>
+<title>Cleware Switch Dashboard</title>
+<meta http-equiv='refresh' content='60' id='refreshMeta'>
 <style>
-body { font-family: Segoe UI, Arial, sans-serif; margin: 0; padding: 0; display: flex; }
-.container { display: flex; width: 100%; }
-.main { flex: 1; padding: 16px; }
-h2 { margin: 16px 0; }
-table { border-collapse: collapse; width: 100%; max-width: 1100px; }
-th, td { padding: 8px; border: 1px solid #ddd; }
-th { background: #f5f5f5; }
-tr:nth-child(even) { background: #fafafa; }
-.actions a.btn {
+body {{ font-family: Arial; background:#1e1e1e; color:#ddd; margin:20px; }}
+h2 {{ color:#4fc3f7; }}
+table {{ border-collapse:collapse; width:100%; background:#2a2a2a; text-align: center;}}
+th,td {{ padding:10px; border-bottom:1px solid #444; }}
+th {{ background:#333; cursor:pointer; }}
+tr:hover {{ background:#3a3a3a; }}
+a {{ color:#4fc3f7; margin-right:5px; }}
+a.btn {{
     display: inline-block; padding: 4px 8px; margin-right: 6px;
     border: 1px solid #aaa; border-radius: 4px;
     background: #eee; color: #000; text-decoration: none;
-}
-.actions a.btn:hover { background: #ddd; }
-#logbox {
-    width: 36%; max-width: 520px; height: 100vh; overflow-y: auto;
-    border-left: 3px solid #aaa; padding: 16px; background: #fafafa;
-}
-.topbar a { margin-right: 12px; text-decoration: none; }
-.topbar a:hover { text-decoration: underline; }
-.mono { font-family: Consolas, Monaco, monospace; }
+}}
+a.btn:hover {{ background: #ddd; }}
+input {{ padding:4px; }}
+.state-on {{ color:#4caf50; font-weight: bold;}}
+.state-off {{ color:#f44336; font-weight: bold;}}
+.state-unk {{ color:#aaa; font-weight: bold;}}
 </style>
 </head>
 <body>
-<div class="container">
-  <div class="main">
-    <div class="topbar">
-      <h2>Cleware Network Control</h2>
-      <div>
-        <span class="mono"><b>Server:</b> """ + server_name + """</span>&nbsp;&nbsp;
-        <a href="/">Refresh</a>
-        <a href="/listall">Raw list</a>
-        <a href="/log">Open log page</a>
-      </div>
-    </div>
-    <table>
-      <tr><th>Node</th><th>Device</th><th>Status</th><th>Actions</th></tr>
-"""
-    for node, desc, devID, color in devices:
-        html += (
-            "<tr>"
-            f"<td>{node}</td>"
-            f"<td>{desc}</td>"
-            f"<td>{color}</td>"
-            "<td class='actions'>"
-            f"<a class='btn' href=\"/toggle/{node}/{devID}\">Toggle</a>"
-            f"<a class='btn' href=\"/turnon/{node}/{devID}\">On</a>"
-            f"<a class='btn' href=\"/turnoff/{node}/{devID}\">Off</a>"
-            "</td>"
-            "</tr>"
-        )
+<h1>Cleware Switch Dashboard</h1>
+<h2>Server: {server_name}</h2>
 
-    html += """
-    </table>
-  </div>
+<table id='deviceTable'>
+<tr>
+<th onclick="sortTable(0)">Node</th>
+<th onclick="sortTable(1)">ID</th>
+<th onclick="sortTable(2)">Name</th>
+<th>State</th>
+<th>Actions</th>
+</tr>
+{''.join(rows)}
+</table>
 
-  <div id="logbox">
-    <h3>Event Log</h3>
-    <pre class="mono">
-"""
-    with event_log_lock:
-        for entry in event_log[-200:]:
-            html += entry + "\n"
+<script>
+// pause refresh while typing
+document.querySelectorAll('input').forEach(inp => {{
+    inp.addEventListener('focus', () => {{
+        document.getElementById('refreshMeta').setAttribute('content', '999999');
+    }});
+    inp.addEventListener('blur', () => {{
+        document.getElementById('refreshMeta').setAttribute('content', '5');
+    }});
+}});
 
-    html += """
-    </pre>
-  </div>
-</div>
+// sorting
+function sortTable(col) {{
+    let table = document.getElementById("deviceTable");
+    let rows = Array.from(table.rows).slice(1);
+    let asc = table.getAttribute("data-sort") !== "asc";
+
+    rows.sort((a, b) => {{
+        let A = a.cells[col].innerText.toLowerCase();
+        let B = b.cells[col].innerText.toLowerCase();
+
+        if (!isNaN(A) && !isNaN(B)) {{
+            return asc ? A - B : B - A;
+        }}
+        return asc ? A.localeCompare(B) : B.localeCompare(A);
+    }});
+
+    rows.forEach(r => table.appendChild(r));
+    table.setAttribute("data-sort", asc ? "asc" : "desc");
+}}
+
+// Auto refresh after action
+function doAction(node, dev, cmd) {{
+    fetch(`/action?node=${{node}}&dev=${{dev}}&cmd=${{cmd}}`)
+        .then(() => location.reload());
+}}
+
+// Auto refresh after renaming
+function renameDevice(ev, form) {{
+    ev.preventDefault();
+    const data = new FormData(form);
+    const params = new URLSearchParams(data).toString();
+
+    fetch("/action?" + params)
+        .then(() => location.reload());
+}}
+</script>
+
 </body>
 </html>
 """
-    return html
 
-def ui_event_log_page():
-    html = "<html><head><meta charset='utf-8'><title>Event Log</title></head><body><h1>Event Log</h1><pre>"
-    with event_log_lock:
-        for entry in event_log:
-            html += entry + "\n"
-    html += "</pre></body></html>"
-    return html
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(html.encode())
 
-# ========================================
-# CONSOLE HELP
-# ========================================
-def send_help() -> str:
-    return (
-        "Available Commands:\n"
-        "  help                     : show this help\n"
-        "  clients                  : list connected clients\n"
-        "  listall                  : list devices from server + all clients\n"
-        "  state  <node:devID>      : get device state\n"
-        "  turnon <node:devID>      : turn ON device\n"
-        "  turnoff <node:devID>     : turn OFF device\n"
-        "  toggle <node:devID>      : toggle device\n"
-        "  exit                     : quit server\n"
-    )
 
-# ========================================
-# START WEB SERVER
-# ========================================
-def start_web_server():
-    httpd = HTTPServer(("0.0.0.0", WEB_PORT), WebHandler)
-    print(f"[WEB] UI available on http://<SERVER_IP>:{WEB_PORT}")
-    httpd.serve_forever()
-
-# ========================================
-# MAIN
-# ========================================
-def main():
-    global server_name
-    server_name = socket.gethostname().lower()
-
-    tHost, iPort, _ = cwUSB_getConfig()
-    print(f"[SERVER] Agent host configured as {tHost}:{iPort} (server name: {server_name})")
-
-    # TCP server for USB agents
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    try:
-        s.bind((tHost, iPort))
-    except OSError as e:
-        if getattr(e, "winerror", None) == 10049:
-            print(f"[SERVER] Configured host '{tHost}' is not local; binding to 0.0.0.0:{iPort}")
-            s.bind(("", iPort))
-        else:
-            print(f"[SERVER] Bind failed on {tHost}:{iPort}, falling back to 0.0.0.0:{iPort} ({e})")
-            s.bind(("", iPort))
-
-    s.listen(50)
-    ip, prt = s.getsockname()[0], s.getsockname()[1]
-    print(f"[SERVER] Agent TCP listening on {ip}:{prt}")
-
-    # Start TCP accept loop for USB agents
-    threading.Thread(target=accept_loop, args=(s,), daemon=True).start()
-    # Start Web UI
-    threading.Thread(target=start_web_server, daemon=True).start()
-
-    print(f"[INFO] Web UI on http://<SERVER_IP>:{WEB_PORT}")
-    print(f"[INFO] Type 'help' for console commands.\n")
-
-    # Console loop
+# ===================== SERVER =====================
+def accept_loop(sock):
     while True:
         try:
-            cmd_line = input("server> ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print("\nExiting.")
-            break
+            conn, addr = sock.accept()
+            name = recv_msg(conn)
 
-        if not cmd_line:
-            continue
+            if not name or not name.startswith("HELLO "):
+                conn.close()
+                continue
 
-        low = cmd_line.lower()
-        if low == "help":
-            print(send_help()); continue
+            cname = name.split()[1]
 
-        if low == "clients":
             with connected_lock:
-                if connected_clients:
-                    for name, (sock, addr) in connected_clients.items():
-                        print(f"{name}  ({addr[0]}:{addr[1]})")
-                else:
-                    print("(no clients connected)")
-            continue
+                connected_clients[cname] = (conn, addr)
 
-        if low == "listall":
-            print(merge_lists(server_name)); continue
+            log_event(f"Client connected: {cname}")
 
-        if any(low.startswith(pfx) for pfx in ("state ", "turnon ", "turnoff ", "toggle ")):
-            parts = cmd_line.split()
-            if len(parts) != 2 or ":" not in parts[1]:
-                print("Usage: state <node:devID>  (example: state pc1:0)")
-                continue
+        except:
+            time.sleep(0.1)
 
-            node, dev = parts[1].split(":", 1)
-            try:
-                dev_int = int(dev)
-            except Exception:
-                print("ERROR: devID must be an integer")
-                continue
+# ===================== MAIN =====================
+def main():
+    global server_name
 
-            verb = parts[0].lower()
-            if node.lower() == server_name:
-                print(local_execute(verb, dev_int))
-            else:
-                print(forward_to_client(node, f"{verb} {dev_int}"))
-            continue
+    server_name = socket.gethostname().lower()
 
-        if low == "exit":
-            break
+    cwUSB_setup()
 
-        print("Unknown command. Type 'help'.")
+    host, port, _ = cwUSB_getConfig()
 
-    # Cleanup
-    with connected_lock:
-        for sock, _ in connected_clients.values():
-            try:
-                sock.close()
-            except Exception:
-                pass
-        connected_clients.clear()
+    s = socket.socket()
+    s.bind(("", port))
+    s.listen()
+
+    threading.Thread(target=accept_loop, args=(s,), daemon=True).start()
+
+    web = ThreadingHTTPServer(("0.0.0.0", WEB_PORT), Handler)
+    web.serve_forever()
+
 
 if __name__ == "__main__":
     main()
