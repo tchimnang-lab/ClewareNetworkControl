@@ -18,8 +18,8 @@ cwbInitiqalized = False
 def cwUSB_getConfig():
     config = configparser.ConfigParser(allow_unnamed_section=True)
     config.read('ClewareUSB.ini')
-#    tHost = 'EH39M31C.ad005.onehc.net'
-    tHost = '10.176.55.207'
+#    tHost = 'IMW1027359C.ad005.onehc.net'
+    tHost = 'IMW1027359C.ad005.onehc.net'
     iPort = 59001
     tDll  = r"USBaccessX64.dll"
     try:
@@ -135,5 +135,48 @@ def cwUSB_list_Devices():
         iDevNum = iDevNum + 1
     return tRet
 
+#Program and device recovery
+def cwUSB_Recover():
+    global cwbInitiqalized, cwObj, cwiNoOfDevices
 
-    
+    try:
+        cwUSB.FCWCloseCleware(cwObj)
+    except:
+        pass
+
+    time.sleep(1)
+
+    cwObj= cwUSB.FCWInitObject()
+    cwiNoOfDevices = cwUSB.FCWOpenCleware(cwObj)
+    return cwiNoOfDevices
+
+def cwUSB_RecoverDevice(iDevNum):
+    global cwbInitiqalized, cwObj, cwiNoOfDevices
+
+    if cwbInitiqalized == False: cwUSB_setup()
+    iSerial = cwUSB.FCWGetSerialNumber(cwObj, iDevNum)
+    if iSerial < 0: return False
+
+    cwUSB.FCWCloseCleware(cwObj)
+    time.sleep(1)
+
+    cwObj = cwUSB.FCWInitObject()
+    cwiNoOfDevices = cwUSB.FCWOpenCleware(cwObj)
+    iDevNum = cwUSB_get_DevNumFromSerial(iSerial)
+
+# Get the USB type for a device
+def cwUSB_get_USBType(iDevNum):
+    if not cwbInitiqalized:
+        cwUSB_setup()
+    return cwUSB.FCWGetUSBType(cwObj, iDevNum)
+
+# Calm a watchdog device
+def cwUSB_CalmWatchdog(iDevNum, t1, t2):
+    if not cwbInitiqalized:
+        cwUSB_setup()
+    cwUSB.FCWCalmWatchdog(cwObj, iDevNum, t1, t2)
+
+def cwUSB_ResetDevice(iDevNum):
+    if not cwbInitiqalized:
+        cwUSB_setup()
+    cwUSB.FCWResetDevice(cwObj, iDevNum)
