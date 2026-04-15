@@ -1,4 +1,5 @@
 
+import json
 import socket
 import threading
 import time
@@ -17,7 +18,7 @@ from ctypes import windll
 SOCKET_TIMEOUT = 5
 STATE_POLL_INTERVAL = 20
 WEB_PORT = int(os.environ.get("CLEWARE_WEB_PORT", "8080"))
-MAX_USB_QUEUE = 100
+MAX_USB_QUEUE = 100 # Maximum number of USB commands to queue
 
 WATCHDOG_DEVICE     = 0x05
 AUTORESET_DEVICE    = 0x06
@@ -40,9 +41,9 @@ USB_RECOVERY_LOCK = threading.Lock()
 USB_HEALTH_ERRORS = 0
 USB_HEALTH_THRESHOLD = 3
 LAST_USB_RECOVERY = 0
-USB_RECOVERY_INTERVAL = 180  # seconds (3 minutes)
+USB_RECOVERY_INTERVAL = 600  # seconds (10 minutes)
 USB_START_TIME = time.time()
-USB_MAX_UPTIME = 600          # 10 minutes before forced device reset
+USB_MAX_UPTIME = 3 * 3600          # 3 hours before forced device reset
 PANIC_WATCHDOG = False
 
 #Escalation counters
@@ -50,9 +51,18 @@ USB_RECOVERY_COUNT = 0
 USB_RESET_COUNT = 0
 USB_MAX_RECOVERIES = 3
 MAX_DEVICE_RESETS = 2
+
+EVENT_LOG = []
+EVENT_LOG_LOCK = threading.Lock()
+MAX_EVENTS = 200
 # ===================== LOGGING =====================
 def log_event(msg: str):
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
+    entry = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}"
+    print(entry)
+    with EVENT_LOG_LOCK:
+        EVENT_LOG.append(entry)
+        if len(EVENT_LOG) > MAX_EVENTS:
+            EVENT_LOG[:] = EVENT_LOG[-MAX_EVENTS:]
 
 # ===================== DLL =====================
 DLL_HANDLE = None
@@ -116,7 +126,6 @@ def usb_execute(cmd, devID=None, extra=None):
     return job.result
 
 # Full USB recovery
-
 def usb_escalating_recover(devID=None, reason="unknown"):
     global USB_RECOVERY_COUNT, LAST_USB_RECOVERY, USB_START_TIME, PANIC_WATCHDOG
 
@@ -236,7 +245,12 @@ def state_loop():
 
                     with STATE_CACHE_LOCK:
                         STATE_CACHE[(server_name, devID)] = raw_state
-                        DEVICE_NAME_CACHE[(server_name, devID)] = name
+                        key = (server_name, devID)
+                        if name != "unknown":
+                            DEVICE_NAME_CACHE[key] = name
+                        elif key not in DEVICE_NAME_CACHE:
+                            DEVICE_NAME_CACHE[key] = "unknown"
+
 
         # ---- health evaluation (ONCE per cycle) ----
         if cycle_ok:
@@ -331,25 +345,46 @@ def execute_cmd(node, dev, action, extra=None):
     node = node.lower()
     dev = int(dev)
 
+    # ----- local node -----
     if node == server_name:
+        result = None
+
         if action == "toggle":
             cur = usb_execute("state", dev)
             new = 0 if cur == "1" else 1
-            return usb_execute("set", dev, new)
-        elif action == "on":
-            return usb_execute("set", dev, 1)
-        elif action == "off":
-            return usb_execute("set", dev, 0)
-        elif action == "rename":
-            return usb_execute("rename", dev, extra)
+            result = usb_execute("set", dev, new)
 
+        elif action == "on":
+            result = usb_execute("set", dev, 1)
+
+        elif action == "off":
+            result = usb_execute("set", dev, 0)
+
+        elif action == "rename":
+            result = usb_execute("rename", dev, extra)
+
+        # IMMEDIATE cache refresh for SSE/UI
+        try:
+            new_state = str(usb_execute("state", dev)).strip()
+            with STATE_CACHE_LOCK:
+                STATE_CACHE[(node, dev)] = new_state
+                if action == "rename" and extra is not None:
+                    DEVICE_NAME_CACHE[(node, dev)] = extra
+        except:
+            pass
+
+        return result
+
+    # ----- remote node -----
     with connected_lock:
         entry = connected_clients.get(node)
+
     if not entry:
         return "NOCLIENT"
 
     sock, _ = entry
     return rpc_call(sock, f"{action} {dev} {extra or ''}".strip())
+
 
 # ===================== WEB =====================
 class Handler(BaseHTTPRequestHandler):
@@ -365,13 +400,52 @@ class Handler(BaseHTTPRequestHandler):
             name = q.get("name", [""])[0]
 
             execute_cmd(node, dev, cmd, name)
-            log_event(f"{cmd} {node}:{dev}")
+            log_event(f"[ACTION] {cmd.upper()} {node}:{dev}")
 
-            self.send_response(302)
-            self.send_header("Location", "/")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
             self.end_headers()
+            self.wfile.write(b'{"status":"ok"}')
             return
 
+        if parsed.path == "/events":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "keep-alive")
+            self.end_headers()
+
+            try:
+                while True:
+                    # build device snapshot
+                    with STATE_CACHE_LOCK:
+                        devices = [
+                            {
+                                "node": node,
+                                "dev": dev,
+                                "name": DEVICE_NAME_CACHE.get((node, dev), ""),
+                                "state": STATE_CACHE.get((node, dev), "?")
+                            }
+                            for (node, dev) in STATE_CACHE
+                        ]
+
+                    with EVENT_LOG_LOCK:
+                        events = EVENT_LOG[-200:]
+
+                    payload = {
+                        "devices": devices,
+                        "events": events
+                    }
+
+                    self.wfile.write(
+                        f"data: {json.dumps(payload)}\n\n".encode()
+                    )
+                    self.wfile.flush()
+                    time.sleep(1)
+            except:
+                pass
+            return
+        
         rows = []
         with STATE_CACHE_LOCK:
             for (node, dev), state in STATE_CACHE.items():
@@ -380,7 +454,7 @@ class Handler(BaseHTTPRequestHandler):
                 state_class = "state-on" if state == "1" else "state-off" if state == "0" else "state-unk"
 
                 rows.append(f"""
-                <tr>
+                <tr data-key="{node}:{dev}">
                     <td>{node}</td>
                     <td>{dev}</td>
                     <td>{name}</td>
@@ -405,7 +479,6 @@ class Handler(BaseHTTPRequestHandler):
 <head>
 <meta charset='UTF-8'>
 <title>Cleware Switch Dashboard</title>
-<meta http-equiv='refresh' content='60' id='refreshMeta'>
 <style>
 body {{ font-family: Arial; background:#1e1e1e; color:#ddd; margin:20px; }}
 h2 {{ color:#4fc3f7; }}
@@ -424,33 +497,62 @@ input {{ padding:4px; }}
 .state-on {{ color:#4caf50; font-weight: bold;}}
 .state-off {{ color:#f44336; font-weight: bold;}}
 .state-unk {{ color:#aaa; font-weight: bold;}}
+#layout {{
+    display: flex;
+    gap: 20px;
+}}
+
+#devices {{
+    flex: 3;
+}}
+
+#events {{
+    flex: 1;
+    background: #111;
+    border: 1px solid #444;
+    padding: 10px;
+    max-height: 500px;
+    overflow-y: auto;
+}}
+
+#events h3 {{
+    margin-top: 0;
+    color: #4fc3f7;
+}}
+
+#eventLog {{
+    font-size: 12px;
+    white-space: pre-wrap;
+}}
+
 </style>
 </head>
 <body>
 <h1>Cleware Switch Dashboard</h1>
 <h2>Server: {server_name}</h2>
 
-<table id='deviceTable'>
-<tr>
-<th onclick="sortTable(0)">Node</th>
-<th onclick="sortTable(1)">ID</th>
-<th onclick="sortTable(2)">Name</th>
-<th>State</th>
-<th>Actions</th>
-</tr>
-{''.join(rows)}
-</table>
+<div id="layout">
+    <div id="devices">
+        <table id='deviceTable'>
+            <tr>
+                <th onclick="sortTable(0)">Node</th>
+                <th onclick="sortTable(1)">ID</th>
+                <th onclick="sortTable(2)">Name</th>
+                <th>State</th>
+                <th>Actions</th>
+            </tr>
+            {''.join(rows)}
+        </table>
+    </div>
+
+    <div id="events">
+        <h3>Event Log</h3>
+        <pre id="eventLog"></pre>
+    </div>
+</div>
 
 <script>
 // pause refresh while typing
-document.querySelectorAll('input').forEach(inp => {{
-    inp.addEventListener('focus', () => {{
-        document.getElementById('refreshMeta').setAttribute('content', '999999');
-    }});
-    inp.addEventListener('blur', () => {{
-        document.getElementById('refreshMeta').setAttribute('content', '5');
-    }});
-}});
 
 // sorting
 function sortTable(col) {{
@@ -475,7 +577,6 @@ function sortTable(col) {{
 // Auto refresh after action
 function doAction(node, dev, cmd) {{
     fetch(`/action?node=${{node}}&dev=${{dev}}&cmd=${{cmd}}`)
-        .then(() => location.reload());
 }}
 
 // Auto refresh after renaming
@@ -483,12 +584,47 @@ function renameDevice(ev, form) {{
     ev.preventDefault();
     const data = new FormData(form);
     const params = new URLSearchParams(data).toString();
-
-    fetch("/action?" + params)
-        .then(() => location.reload());
+    fetch("/action?" + params);
 }}
 </script>
+<script>
+const evtSource = new EventSource("/events");
 
+evtSource.onmessage = function (e) {{
+    const data = JSON.parse(e.data);
+
+    // --- update device table ---
+    const rows = {{}};
+    document.querySelectorAll("#deviceTable tr[data-key]").forEach(tr => {{
+        rows[tr.dataset.key] = tr;
+    }});
+
+    data.devices.forEach(d => {{
+        const key = `${{d.node}}:${{d.dev}}`;
+        let tr = rows[key];
+
+        const stateTxt = d.state === "1" ? "ON" :
+                         d.state === "0" ? "OFF" : "?";
+        const stateClass = d.state === "1" ? "state-on" :
+                           d.state === "0" ? "state-off" : "state-unk";
+
+        if (!tr) {{
+            // device not yet rendered – ignore, will appear on next full refresh
+            return;
+        }}
+
+        tr.children[2].textContent = d.name;
+        tr.children[3].textContent = stateTxt;
+        tr.children[3].classList.remove("state-on", "state-off", "state-unk");
+        tr.children[3].classList.add(stateClass);
+
+    }});
+
+    // --- update event log ---
+    document.getElementById("eventLog").textContent =
+        data.events.join("\\n");
+}};
+</script>
 </body>
 </html>
 """
