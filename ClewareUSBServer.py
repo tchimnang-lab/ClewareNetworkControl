@@ -43,7 +43,7 @@ USB_HEALTH_THRESHOLD = 3
 LAST_USB_RECOVERY = 0
 USB_RECOVERY_INTERVAL = 600  # seconds (10 minutes)
 USB_START_TIME = time.time()
-USB_MAX_UPTIME = 3 * 3600          # 3 hours before forced device reset
+USB_MAX_UPTIME = 2 * 3600          # 2 hours before forced device reset
 PANIC_WATCHDOG = False
 
 #Escalation counters

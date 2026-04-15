@@ -1,6 +1,6 @@
 # Configuration can be done in an unnamed section in
 # ClewareUSB.ini:
-#   host = EH39M31C.ad005.onehc.net
+#   host = 127.0.0.1
 #   port = 59001
 #   dll  = USBaccessX64.dll
 
@@ -18,8 +18,7 @@ cwbInitiqalized = False
 def cwUSB_getConfig():
     config = configparser.ConfigParser(allow_unnamed_section=True)
     config.read('ClewareUSB.ini')
-#    tHost = 'IMW1027359C.ad005.onehc.net'
-    tHost = 'IMW1027359C.ad005.onehc.net'
+    tHost = '127.0.0.1'
     iPort = 59001
     tDll  = r"USBaccessX64.dll"
     try:
