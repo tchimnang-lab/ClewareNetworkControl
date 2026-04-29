@@ -1,6 +1,6 @@
 # Configuration can be done in an unnamed section in
 # ClewareUSB.ini:
-#   host = 127.0.0.1
+#   host = EH39M31C.ad005.onehc.net
 #   port = 59001
 #   dll  = USBaccessX64.dll
 
@@ -9,8 +9,12 @@ import time
 import winreg
 import sys
 import configparser
+import os
 
 REG_PATH = r"SOFTWARE\WOW6432Node\Cleware GmbH\USB"
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DLL_PATH = os.path.join(BASE_DIR, "USBaccessX64.dll")
 
 cwbInitiqalized = False
 
@@ -38,9 +42,10 @@ def cwUSB_setup():
     global cwbInitiqalized
     global cwiNoOfDevices
 
+
     [tHost, iPort, tDll] = cwUSB_getConfig()
     try:
-        cwUSB          = windll.LoadLibrary(tDll)
+        cwUSB = windll.LoadLibrary(DLL_PATH)
         cwObj          = cwUSB.FCWInitObject()
         cwObj          = 0 # unclear, why it only works with 0
         cwiNoOfDevices = cwUSB.FCWOpenCleware(cwObj)
@@ -50,9 +55,12 @@ def cwUSB_setup():
 
 # cleanup your mess. actually not necessary, since this is done on proceess termination
 def cwUSB_cleanup():
-    if cwbInitiqalized == False: return
-    if cwiNoOfDevices > 0: cwUSB.FCWCloseCleware(cwObj)
-    cwUSB.FCWUnInitObject(cwObj)
+    if not cwbInitiqalized:
+        return
+    try:
+        cwUSB.FCWCloseCleware(cwObj)
+    except:
+        pass
 
 # read friendly name of device from registry
 # can set done via ClewareControl, but also via cwUSB_set_NametoNum()
@@ -92,8 +100,8 @@ def cwUSB_get_SerialFromNum(iDevNum):
 
 #readout the current state of the usb switch: 0 = OFF, 1 = ON
 def cwUSB_get_StateFromNum(iDevNum):
-    if cwbInitiqalized == False: cwUSB_setup()
-    return cwUSB.FCWGetContact(cwObj, iDevNum) & 1
+    return cwUSB.FCWGetSwitch(cwObj, iDevNum, 0x10) & 1
+
 
 # sets a new state of an USBSwitch: 0 = OFF, 1 = ON
 def cwUSB_set_StateToNum(iDevNum, iState):

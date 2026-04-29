@@ -6,19 +6,20 @@ import time
 import os
 import re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import unquote, parse_qs
 from queue import Queue
 from typing import Dict, Tuple, List
 from datetime import datetime
 from urllib.parse import parse_qs, urlparse
 from ClewareUSBLib import *
-from ctypes import windll
 
 # ===================== CONFIG =====================
-SOCKET_TIMEOUT = 5
+#SOCKET_TIMEOUT = 5
+socket.setdefaulttimeout(30)
 STATE_POLL_INTERVAL = 20
 WEB_PORT = int(os.environ.get("CLEWARE_WEB_PORT", "8080"))
 MAX_USB_QUEUE = 100 # Maximum number of USB commands to queue
+SSE_CLIENTS = set()
+SSE_LOCK = threading.Lock()
 
 WATCHDOG_DEVICE     = 0x05
 AUTORESET_DEVICE    = 0x06
@@ -41,10 +42,12 @@ USB_RECOVERY_LOCK = threading.Lock()
 USB_HEALTH_ERRORS = 0
 USB_HEALTH_THRESHOLD = 3
 LAST_USB_RECOVERY = 0
-USB_RECOVERY_INTERVAL = 600  # seconds (10 minutes)
+USB_RECOVERY_INTERVAL = 1800  # seconds (30 minutes)
 USB_START_TIME = time.time()
-USB_MAX_UPTIME = 2 * 3600          # 2 hours before forced device reset
+USB_MAX_UPTIME = 12 * 3600          # 12 hours before forced device reset
 PANIC_WATCHDOG = False
+USB_EXEC_LOCK = threading.Lock()
+USB_IN_RECOVERY = False
 
 #Escalation counters
 USB_RECOVERY_COUNT = 0
@@ -65,16 +68,7 @@ def log_event(msg: str):
             EVENT_LOG[:] = EVENT_LOG[-MAX_EVENTS:]
 
 # ===================== DLL =====================
-DLL_HANDLE = None
 
-def load_local_dll():
-    global DLL_HANDLE
-    if DLL_HANDLE:
-        return DLL_HANDLE
-
-    path = os.path.join(os.path.dirname(__file__), "Source", "USBaccessX64.dll")
-    DLL_HANDLE = windll.LoadLibrary(path)
-    return DLL_HANDLE
 
 # ===================== USB WORKER =====================
 class USBCommand:
@@ -87,92 +81,93 @@ class USBCommand:
 
 
 def usb_worker():
-    dll = load_local_dll()
-    dll.FCWInitObject()
-    dll.FCWOpenCleware(0)
+    global USB_IN_RECOVERY
 
     while True:
-        job: USBCommand = USB_QUEUE.get()
+        job = USB_QUEUE.get()
 
-        try:
-            if job.cmd == "list":
-                job.result = cwUSB_list_Devices()
+        with USB_EXEC_LOCK:
+            try:
+                if job.cmd == "list":
+                    job.result = cwUSB_list_Devices()
 
-            elif job.cmd == "state":
-                job.result = str(cwUSB_get_StateFromNum(job.devID))
+                elif job.cmd == "state":
+                    job.result = str(cwUSB_get_StateFromNum(job.devID))
 
-            elif job.cmd == "set":
-                cwUSB_set_StateToNum(job.devID, job.extra)
-                job.result = "OK"
+                elif job.cmd == "set":
+                    cwUSB_set_StateToNum(job.devID, job.extra)
+                    job.result = "OK"
 
-            elif job.cmd == "rename":
-                cwUSB_set_NametoNum(job.devID, job.extra)
-                job.result = "OK"
+                elif job.cmd == "rename":
+                    cwUSB_set_NametoNum(job.devID, job.extra)
+                    job.result = "OK"
 
-        except Exception as e:
-            job.result = f"ERROR:{e}"
+                elif job.cmd == "usb_type":
+                    job.result = cwUSB_get_USBType(job.devID)
+
+                elif job.cmd == "watchdog":
+                    if not USB_IN_RECOVERY:
+                        cwUSB_CalmWatchdog(job.devID, 1, 0)
+                    job.result = "OK"
+
+                elif job.cmd == "recover":
+                    USB_IN_RECOVERY = True
+                    cwUSB_cleanup()
+                    time.sleep(1)
+                    cwUSB_setup()
+                    USB_IN_RECOVERY = False
+                    job.result = "OK"
+
+                elif job.cmd == "reset":
+                    USB_IN_RECOVERY = True
+                    cwUSB_ResetDevice(job.devID)
+                    log_event(f"[USB] Reset device: #{job.devID}")
+                    time.sleep(5)
+                    cwUSB_setup()
+                    USB_IN_RECOVERY = False
+                    job.result = "OK"
+
+            except Exception as e:
+                USB_IN_RECOVERY = False
+                job.result = f"ERROR:{e}"
 
         job.event.set()
-
-threading.Thread(target=usb_worker, daemon=True).start()
 
 def usb_execute(cmd, devID=None, extra=None):
     if USB_QUEUE.qsize() > MAX_USB_QUEUE:
         return "BUSY"
 
     job = USBCommand(cmd, devID, extra)
+    
     USB_QUEUE.put(job)
-    job.event.wait(timeout=5)
+
+    if cmd in ("recover", "reset"):
+        if USB_IN_RECOVERY:
+                return None
+
+    job.event.wait(timeout=10)
     return job.result
 
+
 # Full USB recovery
-def usb_escalating_recover(devID=None, reason="unknown"):
-    global USB_RECOVERY_COUNT, LAST_USB_RECOVERY, USB_START_TIME, PANIC_WATCHDOG
+def usb_escalating_recover(reason="unknown"):
+    global USB_RECOVERY_COUNT, PANIC_WATCHDOG, USB_START_TIME
+    uptime = time.time() - USB_START_TIME
+    USB_RECOVERY_COUNT += 1
+    log_event(f"[USB] Escalation #{USB_RECOVERY_COUNT} — {reason}")
 
-    with USB_RECOVERY_LOCK:
-        USB_RECOVERY_COUNT += 1
-        log_event(f"[USB] Escalation #{USB_RECOVERY_COUNT} — reason: {reason}")
+    usb_execute("recover")
 
-        # ---------- LEVEL 1: full USB re-enumeration ----------
-        try:
-            cwUSB_cleanup()
-        except:
-            pass
-
-        time.sleep(1)
-
-        try:
-            cwUSB_setup()
-            LAST_USB_RECOVERY = time.time()
-            log_event("[USB] Re-enumeration successful")
-        except Exception as e:
-            log_event(f"[USB] Re-enumeration failed: {e}")
-
-        # ---------- LEVEL 3: time-based device reset ----------
-        uptime = time.time() - USB_START_TIME
-        if uptime > USB_MAX_UPTIME:
-            log_event("[USB] Max USB uptime exceeded — resetting devices")
-
-            txt = usb_execute("list")
-            if txt:
-                for line in txt.splitlines():
-                    dev = extract_dev(line)
-                    if dev is not None:
-                        try:
-                            cwUSB_ResetDevice(dev)
-                            log_event(f"[USB] Device {dev} reset")
-                        except:
-                            pass
-
-            USB_START_TIME = time.time()
-            USB_RECOVERY_COUNT = 0
-            time.sleep(5)
-            return
-
-        # ---------- LEVEL 4: panic watchdog ----------
-        if USB_RECOVERY_COUNT >= USB_MAX_RECOVERIES:
-            log_event("[USB] PANIC: unrecoverable USB failure — triggering watchdog reboot")
-            PANIC_WATCHDOG = True
+    if USB_RECOVERY_COUNT >= USB_MAX_RECOVERIES:
+        log_event("[USB] PANIC — triggering watchdog reboot")
+        PANIC_WATCHDOG = True
+        USB_RECOVERY_COUNT = 0
+    
+    if uptime > USB_MAX_UPTIME:
+        log_event("[USB] Max USB uptime exceeded — resetting devices")
+        usb_execute("reset")
+        USB_START_TIME = time.time()
+        USB_RECOVERY_COUNT = 0
 
 # ===================== TCP =====================
 def send_msg(sock, msg):
@@ -218,6 +213,10 @@ def state_loop():
         last_bad_dev = None
 
         txt = usb_execute("list")
+
+        if USB_IN_RECOVERY:
+            time.sleep(1)
+            continue
 
         if not txt:
             cycle_ok = False
@@ -294,23 +293,16 @@ def state_loop():
     
         time.sleep(STATE_POLL_INTERVAL)
 
-threading.Thread(target=state_loop, daemon=True).start()
+#threading.Thread(target=state_loop, daemon=True).start()
 
 # ============== Watchdog loop ==============
 def watchdog_loop():
-    """
-    Feeds watchdog devices unless PANIC_WATCHDOG is set.
-    When panic is active, feeding stops → system reboot.
-    """
-    global PANIC_WATCHDOG
-
     print("[Watchdog] Started watchdog feeder thread")
 
     while True:
-        if PANIC_WATCHDOG:
-            log_event("[Watchdog] PANIC MODE — watchdog feeding stopped")
-            while True:
-                time.sleep(1)   # intentionally do nothing
+        if PANIC_WATCHDOG or USB_IN_RECOVERY:
+            time.sleep(1)
+            continue
 
         txt = usb_execute("list")
         if not txt:
@@ -319,26 +311,10 @@ def watchdog_loop():
 
         for line in txt.splitlines():
             devID = extract_dev(line)
-            if devID is None:
-                continue
-
-            t = cwUSB_get_USBType(devID)
-
-            try:
-                # WATCHDOG / AUTORESET (minutes)
-                if t in (WATCHDOG_DEVICE, AUTORESET_DEVICE):
-                    cwUSB_CalmWatchdog(devID, 1, 0)
-
-                # WATCHDOG XP (seconds)
-                elif t == WATCHDOGXP_DEVICE:
-                    cwUSB_CalmWatchdog(devID, 1, 0)
-
-            except:
-                pass
+            if devID is not None:
+                usb_execute("watchdog", devID)
 
         time.sleep(1)
-
-threading.Thread(target=watchdog_loop, daemon=True).start()
 
 # ===================== COMMAND =====================
 def execute_cmd(node, dev, action, extra=None):
@@ -370,8 +346,9 @@ def execute_cmd(node, dev, action, extra=None):
                 STATE_CACHE[(node, dev)] = new_state
                 if action == "rename" and extra is not None:
                     DEVICE_NAME_CACHE[(node, dev)] = extra
-        except:
-            pass
+        except (BrokenPipeError, ConnectionResetError, OSError):
+        # client disconnected – stop sending
+            return
 
         return result
 
@@ -385,9 +362,45 @@ def execute_cmd(node, dev, action, extra=None):
     sock, _ = entry
     return rpc_call(sock, f"{action} {dev} {extra or ''}".strip())
 
-
 # ===================== WEB =====================
 class Handler(BaseHTTPRequestHandler):
+
+    def sse_broadcaster():
+            while True:
+                with STATE_CACHE_LOCK:
+                    devices = [
+                        {
+                            "node": node,
+                            "dev": dev,
+                            "name": DEVICE_NAME_CACHE.get((node, dev), ""),
+                            "state": STATE_CACHE.get((node, dev), "?")
+                        }
+                        for (node, dev) in STATE_CACHE
+                    ]
+
+                with EVENT_LOG_LOCK:
+                    events = EVENT_LOG[-20:]
+
+                payload = {
+                    "devices": devices,
+                    "events": events
+                }
+                msg = f"data: {json.dumps(payload)}\n\n".encode()
+
+                with SSE_LOCK:
+                    dead = []
+                    for client in SSE_CLIENTS:
+                        try:
+                            client.write(msg)
+                            client.flush()
+                        except:
+                            dead.append(client)
+                    for d in dead:
+                        SSE_CLIENTS.remove(d)
+
+                time.sleep(2)
+
+    threading.Thread(target=sse_broadcaster, daemon=True).start()
 
     def do_GET(self):
         parsed = urlparse(self.path)
@@ -415,36 +428,19 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Connection", "keep-alive")
             self.end_headers()
 
+            with SSE_LOCK:
+                SSE_CLIENTS.add(self.wfile)
+
             try:
                 while True:
-                    # build device snapshot
-                    with STATE_CACHE_LOCK:
-                        devices = [
-                            {
-                                "node": node,
-                                "dev": dev,
-                                "name": DEVICE_NAME_CACHE.get((node, dev), ""),
-                                "state": STATE_CACHE.get((node, dev), "?")
-                            }
-                            for (node, dev) in STATE_CACHE
-                        ]
-
-                    with EVENT_LOG_LOCK:
-                        events = EVENT_LOG[-200:]
-
-                    payload = {
-                        "devices": devices,
-                        "events": events
-                    }
-
-                    self.wfile.write(
-                        f"data: {json.dumps(payload)}\n\n".encode()
-                    )
-                    self.wfile.flush()
-                    time.sleep(1)
+                    time.sleep(60)
             except:
                 pass
+            finally:
+                with SSE_LOCK:
+                    SSE_CLIENTS.discard(self.wfile)
             return
+
         
         rows = []
         with STATE_CACHE_LOCK:
@@ -662,6 +658,14 @@ def main():
     server_name = socket.gethostname().lower()
 
     cwUSB_setup()
+    #print("Cleware devices found:", cwiNoOfDevices)
+
+    
+    #start threads AFTER setup
+    threading.Thread(target=usb_worker, daemon=True).start()
+    threading.Thread(target=state_loop, daemon=True).start()
+    threading.Thread(target=watchdog_loop, daemon=True).start()
+
 
     host, port, _ = cwUSB_getConfig()
 
