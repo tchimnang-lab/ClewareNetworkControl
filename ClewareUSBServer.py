@@ -14,8 +14,8 @@ from ClewareUSBLib import *
 
 # ===================== CONFIG =====================
 #SOCKET_TIMEOUT = 5
-socket.setdefaulttimeout(30)
-STATE_POLL_INTERVAL = 20
+#socket.setdefaulttimeout(30)
+STATE_POLL_INTERVAL = 10 # seconds
 WEB_PORT = int(os.environ.get("CLEWARE_WEB_PORT", "8080"))
 MAX_USB_QUEUE = 100 # Maximum number of USB commands to queue
 SSE_CLIENTS = set()
@@ -36,11 +36,13 @@ DEVICE_NAME_CACHE: Dict[Tuple[str, int], str] = {}
 USB_QUEUE: Queue = Queue()
 
 server_name = None
+device_counter = 0
+conn_clients = 0
 
 # USB health & recovery
 USB_RECOVERY_LOCK = threading.Lock()
 USB_HEALTH_ERRORS = 0
-USB_HEALTH_THRESHOLD = 3
+USB_HEALTH_THRESHOLD = 5
 LAST_USB_RECOVERY = 0
 USB_RECOVERY_INTERVAL = 1800  # seconds (30 minutes)
 USB_START_TIME = time.time()
@@ -52,7 +54,7 @@ USB_IN_RECOVERY = False
 #Escalation counters
 USB_RECOVERY_COUNT = 0
 USB_RESET_COUNT = 0
-USB_MAX_RECOVERIES = 3
+USB_MAX_RECOVERIES = 5
 MAX_DEVICE_RESETS = 2
 
 EVENT_LOG = []
@@ -121,7 +123,7 @@ def usb_worker():
                 elif job.cmd == "reset":
                     USB_IN_RECOVERY = True
                     cwUSB_ResetDevice(job.devID)
-                    log_event(f"[USB] Reset device: #{job.devID}")
+                    #log_event(f"[USB] Reset device: #{job.devID}")
                     time.sleep(5)
                     cwUSB_setup()
                     USB_IN_RECOVERY = False
@@ -143,7 +145,7 @@ def usb_execute(cmd, devID=None, extra=None):
 
     if cmd in ("recover", "reset"):
         if USB_IN_RECOVERY:
-                return None
+            return None
 
     job.event.wait(timeout=10)
     return job.result
@@ -159,15 +161,15 @@ def usb_escalating_recover(reason="unknown"):
     usb_execute("recover")
 
     if USB_RECOVERY_COUNT >= USB_MAX_RECOVERIES:
-        log_event("[USB] PANIC — triggering watchdog reboot")
+        log_event("[USB] INFO — triggering watchdog reboot")
         PANIC_WATCHDOG = True
         USB_RECOVERY_COUNT = 0
     
-    if uptime > USB_MAX_UPTIME:
-        log_event("[USB] Max USB uptime exceeded — resetting devices")
-        usb_execute("reset")
-        USB_START_TIME = time.time()
-        USB_RECOVERY_COUNT = 0
+    #if uptime > USB_MAX_UPTIME:
+        #log_event("[USB] Max USB uptime exceeded — resetting devices")
+        #usb_execute("reset")
+        #USB_START_TIME = time.time()
+        #USB_RECOVERY_COUNT = 0
 
 # ===================== TCP =====================
 def send_msg(sock, msg):
@@ -207,10 +209,15 @@ def extract_name(line):
 def state_loop():
     global USB_HEALTH_ERRORS
     global LAST_USB_RECOVERY
+    global device_counter
+    global conn_clients
+    
 
     while True:
         cycle_ok = True
         last_bad_dev = None
+        device_counter = 0
+        conn_clients = 0
 
         txt = usb_execute("list")
 
@@ -227,7 +234,9 @@ def state_loop():
             else:
                 for line in lines:
                     devID = extract_dev(line)
-                    
+                    if devID is not None:
+                        device_counter += 1
+
                     if not txt or not lines:
                         usb_escalating_recover(reason="device list empty")
 
@@ -273,9 +282,12 @@ def state_loop():
         # remote nodes via RPC
         with connected_lock:
             clients = dict(connected_clients)
+            conn_clients = len(clients)
 
         for cname, (sock, _) in clients.items():
             reply = rpc_call(sock, "state_all")
+            #conn_clients += 1
+
             if not reply:
                 continue
 
@@ -283,7 +295,6 @@ def state_loop():
                 try:
                     dev, state, name = entry.split(":")
                     dev = int(dev)
-
                     with STATE_CACHE_LOCK:
                         STATE_CACHE[(cname, dev)] = state.strip()  # raw
                         DEVICE_NAME_CACHE[(cname, dev)] = name.strip()
@@ -292,8 +303,6 @@ def state_loop():
                     pass
     
         time.sleep(STATE_POLL_INTERVAL)
-
-#threading.Thread(target=state_loop, daemon=True).start()
 
 # ============== Watchdog loop ==============
 def watchdog_loop():
@@ -525,7 +534,10 @@ input {{ padding:4px; }}
 </head>
 <body>
 <h1>Cleware Switch Dashboard</h1>
-<h2>Server: {server_name}</h2>
+<h2>Server: {server_name} 
+<span style="color:white;font-size:smaller;"> Local Cleware devices: {device_counter}</span> 
+<span style="color:grey;">Connected clients: {conn_clients}</span>
+</h2>
 
 <div id="layout">
     <div id="devices">
@@ -632,7 +644,10 @@ evtSource.onmessage = function (e) {{
 
 # ===================== SERVER =====================
 def accept_loop(sock):
+    global conn_clients
+
     while True:
+        #conn_clients = 0
         try:
             conn, addr = sock.accept()
             name = recv_msg(conn)
@@ -647,6 +662,7 @@ def accept_loop(sock):
                 connected_clients[cname] = (conn, addr)
 
             log_event(f"Client connected: {cname}")
+            #conn_clients += 1
 
         except:
             time.sleep(0.1)
@@ -659,7 +675,6 @@ def main():
 
     cwUSB_setup()
     #print("Cleware devices found:", cwiNoOfDevices)
-
     
     #start threads AFTER setup
     threading.Thread(target=usb_worker, daemon=True).start()

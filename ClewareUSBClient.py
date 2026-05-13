@@ -1,117 +1,149 @@
-# client.py (USB agent that controls local Cleware USB and talks to the server)
+# client.py — robust Cleware USB agent
 import socket
-import sys
-import os
+import threading
 import time
-from ctypes import windll
-from ClewareUSBLib import cwUSB_getConfig, cwUSB_list_Devices, cwUSB_get_StateFromNum, cwUSB_set_NametoNum, cwUSB_set_StateToNum
+import os
+import queue
+
+from ClewareUSBServer import*
+from ClewareUSBLib import (
+    cwUSB_setup,
+    cwUSB_cleanup,
+    cwUSB_list_Devices,
+    cwUSB_get_StateFromNum,
+    cwUSB_set_StateToNum,
+    cwUSB_set_NametoNum,
+    cwUSB_get_NameFromNum,
+    #cwiNoOfDevices,
+)
 
 RECONNECT_BASE_DELAY = 2
 RECONNECT_MAX_DELAY = 30
+USB_CMD_TIMEOUT = 10
 
-def handle_command(command: str) -> str:
-    """Execute a single hardware command locally and return a string response."""
-    dll_path = os.environ.get(
-        "CLEWARE_DLL_PATH",
-        os.path.join(os.path.dirname(__file__), "Source", "USBaccessX64.dll")
-    )
-    mydll = windll.LoadLibrary(dll_path)
-    mydll.FCWInitObject()
-    devCnt = mydll.FCWOpenCleware(0)
 
-    parts = (command or "").strip().split()
-    if not parts:
-        return "ERROR: EMPTY_CMD"
+# ===================== USB WORKER =====================
 
-    cmd = parts[0].lower()
+USB_QUEUE = queue.Queue()
+USB_LOCK = threading.Lock()
+USB_READY = False
 
-    if cmd == "list":
-        # Note: return an empty string if no devices, so the server can still mark the node online
-        return cwUSB_list_Devices() if devCnt > 0 else ""
 
-    if devCnt == 0:
-        return "NO_DEVICES"
+class USBCommand:
+    def __init__(self, cmd, args=None):
+        self.cmd = cmd
+        self.args = args or []
+        self.result = None
+        self.event = threading.Event()
 
-    if len(parts) < 2:
-        return "ERROR: Missing devID"
 
-    try:
-        devID = int(parts[1])
-    except Exception:
-        return "ERROR: devID must be int"
+def usb_worker():
+    global USB_READY
 
-    if cmd == "state":
-        return f"{cwUSB_get_StateFromNum(devID)}"
-
-    if cmd == "turnon":
-        cwUSB_set_StateToNum(devID, 1)
-        return "OK"
-
-    if cmd == "turnoff":
-        cwUSB_set_StateToNum(devID, 0)
-        return "OK"
-
-    if cmd == "toggle":
-        cur = cwUSB_get_StateFromNum(devID)
-        cwUSB_set_StateToNum(devID, 0 if cur else 1)
-        return "OK"
-    
-    elif cmd == "rename":
-        if len(parts) < 3:
-            return "ERROR: Missing newName"
-        newName = " ".join(parts[2:])
+    while True:
+        job = USB_QUEUE.get()
         try:
-            cwUSB_set_NametoNum(devID, newName)
-            return "OK"
+            with USB_LOCK:
+                if job.cmd == "state_all":
+                    entries = []
+                    for dev in range(cwUSB.FCWOpenCleware(0)):
+                        try:
+                            s = cwUSB_get_StateFromNum(dev)
+                            n = cwUSB_get_NameFromNum(dev)
+                            entries.append(f"{dev}:{s}:{n}")
+                        except Exception:
+                            pass
+                    job.result = ",".join(entries)
+
+                elif job.cmd == "state":
+                    dev = int(job.args[0])
+                    job.result = str(cwUSB_get_StateFromNum(dev))
+
+                elif job.cmd == "set":
+                    dev, val = int(job.args[0]), int(job.args[1])
+                    cwUSB_set_StateToNum(dev, val)
+                    job.result = "OK"
+
+                elif job.cmd == "rename":
+                    dev = int(job.args[0])
+                    name = " ".join(job.args[1:])
+                    cwUSB_set_NametoNum(dev, name)
+                    job.result = "OK"
+
+                elif job.cmd == "list":
+                    job.result = cwUSB_list_Devices()
+
+                else:
+                    job.result = "ERROR: UNKNOWN_CMD"
+
         except Exception as e:
-            return f"ERROR: rename failed ({e})"
+            # USB may be temporarily unavailable — try to recover
+            try:
+                cwUSB_cleanup()
+                time.sleep(1)
+                cwUSB_setup()
+            except Exception:
+                pass
+            job.result = f"ERROR:{e}"
 
-    return "ERROR: UNKNOWN_CMD"
+        job.event.set()
 
+
+threading.Thread(target=usb_worker, daemon=True).start()
+
+
+def usb_execute(cmd, args=None):
+    job = USBCommand(cmd, args)
+    USB_QUEUE.put(job)
+    ok = job.event.wait(timeout=USB_CMD_TIMEOUT)
+    if not ok:
+        return "ERROR: USB_TIMEOUT"
+    return job.result
+
+
+# ===================== SOCKET CLIENT =====================
 
 def run_agent():
-    # Read server host/port from your existing config
     host, port, _ = cwUSB_getConfig()
-    hostname = socket.gethostname()
-    print(f"[CLIENT] Will connect to server at {host}:{port} as {hostname}")
+    node = socket.gethostname().lower()
+
+    print(f"[CLIENT] Starting Cleware agent as {node}")
+
+    # Initialize USB once
+    cwUSB_setup()
 
     delay = RECONNECT_BASE_DELAY
+
     while True:
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                 s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                 s.connect((host, port))
-                # Introduce ourselves (lowercased name will be stored server-side)
-                s.sendall(f"HELLO {hostname}".encode("utf-8"))
-                print("[CLIENT] Connected. Waiting for commands...")
+                s.sendall(f"HELLO {node}\n".encode())
+
+                print("[CLIENT] Connected to server")
+
+                delay = RECONNECT_BASE_DELAY
 
                 while True:
                     data = s.recv(4096)
                     if not data:
-                        print("[CLIENT] Server closed connection.")
-                        break
+                        raise ConnectionError("Server disconnected")
 
-                    command = data.decode(errors="ignore").strip()
-                    if not command:
-                        s.sendall(b"ERROR: EMPTY_CMD")
+                    line = data.decode(errors="ignore").strip()
+                    if not line:
                         continue
 
-                    try:
-                        resp = handle_command(command)
-                    except Exception as e:
-                        resp = f"ERROR: {e}"
+                    parts = line.split()
+                    cmd, args = parts[0], parts[1:]
 
-                    s.sendall(resp.encode("utf-8"))
-
-            # Disconnected: try to reconnect with backoff
-            print(f"[CLIENT] Disconnected. Reconnecting in {delay}s ...")
-            time.sleep(delay)
-            delay = min(RECONNECT_MAX_DELAY, delay * 2)
+                    resp = usb_execute(cmd, args)
+                    s.sendall((resp + "\n").encode())
 
         except Exception as e:
-            print(f"[CLIENT] Connect error: {e}. Retrying in {delay}s ...")
+            print(f"[CLIENT] Disconnected: {e}")
             time.sleep(delay)
-            delay = min(RECONNECT_MAX_DELAY, delay * 2)
+            delay = min(delay * 2, RECONNECT_MAX_DELAY)
 
 
 if __name__ == "__main__":
