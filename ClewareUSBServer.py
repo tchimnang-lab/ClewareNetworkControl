@@ -1,6 +1,7 @@
 
 import json
 import socket
+import ssl
 import threading
 import time
 import os
@@ -13,8 +14,6 @@ from urllib.parse import parse_qs, urlparse
 from ClewareUSBLib import *
 
 # ===================== CONFIG =====================
-#SOCKET_TIMEOUT = 5
-#socket.setdefaulttimeout(30)
 STATE_POLL_INTERVAL = 10 # seconds
 WEB_PORT = int(os.environ.get("CLEWARE_WEB_PORT", "8080"))
 MAX_USB_QUEUE = 100 # Maximum number of USB commands to queue
@@ -60,6 +59,13 @@ MAX_DEVICE_RESETS = 2
 EVENT_LOG = []
 EVENT_LOG_LOCK = threading.Lock()
 MAX_EVENTS = 200
+
+PAGE_TITLE = "Cleware Switch Dashboard"
+EDIT_TITLE = "✎"
+#Authentication
+#USERNAME = os.environ.get("WEB_USER", "admin")
+#PASSWORD = os.environ.get("WEB_PASS", "changeme")
+
 # ===================== LOGGING =====================
 def log_event(msg: str):
     entry = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}"
@@ -69,9 +75,6 @@ def log_event(msg: str):
         if len(EVENT_LOG) > MAX_EVENTS:
             EVENT_LOG[:] = EVENT_LOG[-MAX_EVENTS:]
 
-# ===================== DLL =====================
-
-
 # ===================== USB WORKER =====================
 class USBCommand:
     def __init__(self, cmd, devID=None, extra=None):
@@ -80,7 +83,6 @@ class USBCommand:
         self.extra = extra
         self.result = None
         self.event = threading.Event()
-
 
 def usb_worker():
     global USB_IN_RECOVERY
@@ -282,11 +284,10 @@ def state_loop():
         # remote nodes via RPC
         with connected_lock:
             clients = dict(connected_clients)
-            conn_clients = len(clients)
+            conn_clients = len(connected_clients)
 
         for cname, (sock, _) in clients.items():
             reply = rpc_call(sock, "state_all")
-            #conn_clients += 1
 
             if not reply:
                 continue
@@ -450,6 +451,19 @@ class Handler(BaseHTTPRequestHandler):
                     SSE_CLIENTS.discard(self.wfile)
             return
 
+# Save page title change via GET: /set_title?title=...
+        if parsed.path == "/set_title":
+            q = parse_qs(parsed.query)
+            new_title = q.get("title", [""])[0]
+            if new_title:
+                global PAGE_TITLE
+                PAGE_TITLE = new_title
+                log_event(f"[WEB] Page title updated: {new_title}")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"status":"ok"}')
+            return
         
         rows = []
         with STATE_CACHE_LOCK:
@@ -533,7 +547,7 @@ input {{ padding:4px; }}
 </style>
 </head>
 <body>
-<h1>Cleware Switch Dashboard</h1>
+<h1><span id="title">{PAGE_TITLE}</span> <span id="editTitle">{EDIT_TITLE}</span></h1>
 <h2>Server: {server_name} 
 <span style="color:white;font-size:smaller;"> Local Cleware devices: {device_counter}</span> 
 <span style="color:grey;">Connected clients: {conn_clients}</span>
@@ -560,7 +574,23 @@ input {{ padding:4px; }}
 </div>
 
 <script>
-// pause refresh while typing
+// rename h1 title on EDIT_TITLE click
+document.querySelector("#editTitle").addEventListener("click", () => {{
+    const current = document.querySelector("#title").textContent;
+    const newTitle = prompt("Enter new dashboard title:", current);
+    if (newTitle && newTitle !== current) {{
+        fetch("/set_title?title=" + encodeURIComponent(newTitle))
+            .then(r => {{
+                if (r.ok) {{
+                    document.title = newTitle;
+                    document.querySelector("#title").textContent = newTitle;
+                }} else {{
+                    alert("Failed to save title");
+                }}
+            }})
+            .catch(() => alert("Failed to save title"));
+    }}
+}});
 
 // sorting
 function sortTable(col) {{
@@ -691,6 +721,12 @@ def main():
     threading.Thread(target=accept_loop, args=(s,), daemon=True).start()
 
     web = ThreadingHTTPServer(("0.0.0.0", WEB_PORT), Handler)
+
+    # Enable SSL
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain("localhost+1.pem", "localhost+1-key.pem")
+    web.socket = ctx.wrap_socket(web.socket, server_side=True)
+    
     web.serve_forever()
 
 
