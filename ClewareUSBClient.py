@@ -5,8 +5,8 @@ import queue
 import tkinter as tk
 import configparser
 import threading
+import re
 
-from Cleware_USB_Server import*
 from ClewareUSBLib import (
     cwUSB_setup,
     cwUSB_cleanup,
@@ -39,6 +39,16 @@ class USBCommand:
         self.event = threading.Event()
 
 
+def extract_name(line):
+    m = re.search(r"Name=(.*)$", line)
+    return m.group(1).strip() if m else "unknown"
+
+def extract_serial(line):
+    import re
+    m = re.search(r"serial number=\s*(\d+)", line)
+    return int(m.group(1)) if m else None
+
+
 def usb_worker():
     global USB_READY
 
@@ -47,22 +57,49 @@ def usb_worker():
         try:
             with USB_LOCK:
                 if job.cmd == "state_all":
+                    
                     entries = []
-                    for dev in range(cwUSB.FCWOpenCleware(0)):
+
+                    txt = cwUSB_list_Devices()
+                    if not txt:
+                        job.result = ""
+                        return
+
+                    for i, line in enumerate(txt.splitlines()):
                         try:
-                            s = cwUSB_get_StateFromNum(dev)
-                            n = cwUSB_get_NameFromNum(dev)
-                            entries.append(f"{dev}:{s}:{n}")
-                        except Exception:
+                            # Extract state
+                            state = "1" if "ON" in line else "0"
+
+                            # Extract name
+                            name = extract_name(line)
+
+                            # Use index as devID (matches Cleware numbering)
+                            dev = extract_serial(line)
+
+                            entries.append(f"{dev}:{state}:{name}")
+
+                        except:
                             pass
+
                     job.result = ",".join(entries)
+
 
                 elif job.cmd == "state":
                     dev = int(job.args[0])
                     job.result = str(cwUSB_get_StateFromNum(dev))
 
-                elif job.cmd == "set":
-                    dev, val = int(job.args[0]), int(job.args[1])
+                elif job.cmd == "on":
+                    dev, val = int(job.args[0]), 1
+                    cwUSB_set_StateToNum(dev, val)
+                    job.result = "OK"
+
+                elif job.cmd == "off":
+                    dev, val = int(job.args[0]), 0
+                    cwUSB_set_StateToNum(dev, val)
+                    job.result = "OK"
+
+                elif job.cmd == "toggle":
+                    dev, val = int(job.args[0]), 1 if cwUSB_get_StateFromNum(int(job.args[0])) == 0 else 0
                     cwUSB_set_StateToNum(dev, val)
                     job.result = "OK"
 
@@ -88,6 +125,7 @@ def usb_worker():
                 pass
             job.result = f"ERROR:{e}"
 
+        print(f"[CLIENT] RESP {job.cmd!r} -> {job.result!r}")
         job.event.set()
 
 
@@ -159,7 +197,9 @@ def run_agent():
                     cmd, args = parts[0], parts[1:]
 
                     resp = usb_execute(cmd, args)
-                    s.sendall((resp + "\n").encode())
+                    # debug: log what client will send back
+                    #print(f"[CLIENT] RESP {cmd!r} -> {resp!r}")
+                    s.sendall((resp + "\n").encode("utf-8"))
 
         except Exception as e:
             print(f"[CLIENT] Disconnected: {e}")

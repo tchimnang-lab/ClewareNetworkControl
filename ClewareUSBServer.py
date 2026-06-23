@@ -6,6 +6,7 @@ import threading
 import time
 import os
 import re
+import configparser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from queue import Queue
 from typing import Dict, Tuple, List
@@ -60,11 +61,8 @@ EVENT_LOG = []
 EVENT_LOG_LOCK = threading.Lock()
 MAX_EVENTS = 200
 
-PAGE_TITLE = "Cleware Switch Dashboard"
+PAGE_TITLE = None
 EDIT_TITLE = "✎"
-#Authentication
-#USERNAME = os.environ.get("WEB_USER", "admin")
-#PASSWORD = os.environ.get("WEB_PASS", "changeme")
 
 # ===================== LOGGING =====================
 def log_event(msg: str):
@@ -180,21 +178,25 @@ def send_msg(sock, msg):
 
 def recv_msg(sock):
     buffer = ""
-    while True:
-        data = sock.recv(1024).decode()
-        if not data:
-            return None
-        buffer += data
-        if "\n" in buffer:
-            msg, _ = buffer.split("\n", 1)
-            return msg.strip()
-
+    try:
+        while True:
+            data = sock.recv(1024).decode()
+            if not data:
+                return None
+            buffer += data
+            if "\n" in buffer:
+                msg, _ = buffer.split("\n", 1)
+                return msg.strip()
+    except Exception as e:
+        log_event(f"[RPC] recv_msg failed: {e}")
+        return None
 
 def rpc_call(sock, msg):
     try:
         send_msg(sock, msg)
         return recv_msg(sock)
-    except:
+    except Exception as e:
+        log_event(f"[RPC] {msg!r} failed: {e}")
         return None
 
 # ===================== STATE LOOP =====================
@@ -202,11 +204,9 @@ def extract_dev(line):
     m = re.search(r"serial number=\s*(\d+)", line)
     return int(m.group(1)) if m else None
 
-
 def extract_name(line):
     m = re.search(r"Name=(.*)$", line)
     return m.group(1).strip() if m else ""
-
 
 def state_loop():
     global USB_HEALTH_ERRORS
@@ -372,6 +372,37 @@ def execute_cmd(node, dev, action, extra=None):
     sock, _ = entry
     return rpc_call(sock, f"{action} {dev} {extra or ''}".strip())
 
+# ========== Save page title ==========
+def get_title():
+    global PAGE_TITLE
+    config = configparser.ConfigParser(allow_unnamed_section=True)
+    config.read('ClewareUSB.ini')
+    title = "Cleware Switch Dashboard" #Default title
+    try:
+        NetConfig = config[configparser.UNNAMED_SECTION]
+        PAGE_TITLE = NetConfig.get('title', title)
+    except Exception:
+        pass
+    return PAGE_TITLE
+
+def save_title(new_title):
+    global PAGE_TITLE
+
+    config = configparser.ConfigParser(allow_unnamed_section=True)
+    config.read('ClewareUSB.ini')
+
+    try:
+        NetConfig = config[configparser.UNNAMED_SECTION]
+        host = NetConfig.get('host', '127.0.0.1')
+        port = NetConfig.getint('port', 59001)
+        dll  = NetConfig.get('dll', r"USBaccessX64.dll")
+        PAGE_TITLE = new_title
+    except Exception:
+        pass
+
+    with open("ClewareUSB.ini", "w") as f:
+        f.write(f"host = {host}\nport = {port}\ndll  = USBaccessX64.dll\ntitle = {PAGE_TITLE}")
+
 # ===================== WEB =====================
 class Handler(BaseHTTPRequestHandler):
 
@@ -458,6 +489,7 @@ class Handler(BaseHTTPRequestHandler):
             if new_title:
                 global PAGE_TITLE
                 PAGE_TITLE = new_title
+                save_title(new_title)
                 log_event(f"[WEB] Page title updated: {new_title}")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -547,7 +579,7 @@ input {{ padding:4px; }}
 </style>
 </head>
 <body>
-<h1><span id="title">{PAGE_TITLE}</span> <span id="editTitle">{EDIT_TITLE}</span></h1>
+<h1><span id="title">{get_title()}</span> <span id="editTitle">{EDIT_TITLE}</span></h1>
 <h2>Server: {server_name} 
 <span style="color:white;font-size:smaller;"> Local Cleware devices: {device_counter}</span> 
 <span style="color:grey;">Connected clients: {conn_clients}</span>
