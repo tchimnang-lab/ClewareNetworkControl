@@ -1,0 +1,766 @@
+
+import json
+import socket
+import ssl
+import threading
+import time
+import os
+import re
+import configparser
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from queue import Queue
+from typing import Dict, Tuple, List
+from datetime import datetime
+from urllib.parse import parse_qs, urlparse
+from ClewareUSBLib import *
+
+# ===================== CONFIG =====================
+STATE_POLL_INTERVAL = 10 # seconds
+WEB_PORT = int(os.environ.get("CLEWARE_WEB_PORT", "8080"))
+MAX_USB_QUEUE = 100 # Maximum number of USB commands to queue
+SSE_CLIENTS = set()
+SSE_LOCK = threading.Lock()
+
+WATCHDOG_DEVICE     = 0x05
+AUTORESET_DEVICE    = 0x06
+WATCHDOGXP_DEVICE   = 0x07
+# ===================== GLOBALS =====================
+connected_clients: Dict[str, Tuple[socket.socket, Tuple[str, int]]] = {}
+connected_lock = threading.Lock()
+
+STATE_CACHE: Dict[Tuple[str, int], str] = {}
+STATE_CACHE_LOCK = threading.Lock()
+
+DEVICE_NAME_CACHE: Dict[Tuple[str, int], str] = {}
+
+USB_QUEUE: Queue = Queue()
+
+server_name = None
+device_counter = 0
+conn_clients = 0
+
+# USB health & recovery
+USB_RECOVERY_LOCK = threading.Lock()
+USB_HEALTH_ERRORS = 0
+USB_HEALTH_THRESHOLD = 5
+LAST_USB_RECOVERY = 0
+USB_RECOVERY_INTERVAL = 1800  # seconds (30 minutes)
+USB_START_TIME = time.time()
+USB_MAX_UPTIME = 12 * 3600          # 12 hours before forced device reset
+PANIC_WATCHDOG = False
+USB_EXEC_LOCK = threading.Lock()
+USB_IN_RECOVERY = False
+
+#Escalation counters
+USB_RECOVERY_COUNT = 0
+USB_RESET_COUNT = 0
+USB_MAX_RECOVERIES = 5
+MAX_DEVICE_RESETS = 2
+
+EVENT_LOG = []
+EVENT_LOG_LOCK = threading.Lock()
+MAX_EVENTS = 200
+
+PAGE_TITLE = None
+EDIT_TITLE = "✎"
+
+# ===================== LOGGING =====================
+def log_event(msg: str):
+    entry = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}"
+    print(entry)
+    with EVENT_LOG_LOCK:
+        EVENT_LOG.append(entry)
+        if len(EVENT_LOG) > MAX_EVENTS:
+            EVENT_LOG[:] = EVENT_LOG[-MAX_EVENTS:]
+
+# ===================== USB WORKER =====================
+class USBCommand:
+    def __init__(self, cmd, devID=None, extra=None):
+        self.cmd = cmd
+        self.devID = devID
+        self.extra = extra
+        self.result = None
+        self.event = threading.Event()
+
+def usb_worker():
+    global USB_IN_RECOVERY
+
+    while True:
+        job = USB_QUEUE.get()
+
+        with USB_EXEC_LOCK:
+            try:
+                if job.cmd == "list":
+                    job.result = cwUSB_list_Devices()
+
+                elif job.cmd == "state":
+                    job.result = str(cwUSB_get_StateFromNum(job.devID))
+
+                elif job.cmd == "set":
+                    cwUSB_set_StateToNum(job.devID, job.extra)
+                    job.result = "OK"
+
+                elif job.cmd == "rename":
+                    cwUSB_set_NametoNum(job.devID, job.extra)
+                    job.result = "OK"
+
+                elif job.cmd == "usb_type":
+                    job.result = cwUSB_get_USBType(job.devID)
+
+                elif job.cmd == "watchdog":
+                    if not USB_IN_RECOVERY:
+                        cwUSB_CalmWatchdog(job.devID, 1, 0)
+                    job.result = "OK"
+
+                elif job.cmd == "recover":
+                    USB_IN_RECOVERY = True
+                    cwUSB_cleanup()
+                    time.sleep(1)
+                    cwUSB_setup()
+                    USB_IN_RECOVERY = False
+                    job.result = "OK"
+
+                elif job.cmd == "reset":
+                    USB_IN_RECOVERY = True
+                    cwUSB_ResetDevice(job.devID)
+                    #log_event(f"[USB] Reset device: #{job.devID}")
+                    time.sleep(5)
+                    cwUSB_setup()
+                    USB_IN_RECOVERY = False
+                    job.result = "OK"
+
+            except Exception as e:
+                USB_IN_RECOVERY = False
+                job.result = f"ERROR:{e}"
+
+        job.event.set()
+
+def usb_execute(cmd, devID=None, extra=None):
+    if USB_QUEUE.qsize() > MAX_USB_QUEUE:
+        return "BUSY"
+
+    job = USBCommand(cmd, devID, extra)
+    
+    USB_QUEUE.put(job)
+
+    if cmd in ("recover", "reset"):
+        if USB_IN_RECOVERY:
+            return None
+
+    job.event.wait(timeout=10)
+    return job.result
+
+
+# Full USB recovery
+def usb_escalating_recover(reason="unknown"):
+    global USB_RECOVERY_COUNT, PANIC_WATCHDOG, USB_START_TIME
+    uptime = time.time() - USB_START_TIME
+    USB_RECOVERY_COUNT += 1
+    log_event(f"[USB] Escalation #{USB_RECOVERY_COUNT} — {reason}")
+
+    usb_execute("recover")
+
+    if USB_RECOVERY_COUNT >= USB_MAX_RECOVERIES:
+        log_event("[USB] INFO — triggering watchdog reboot")
+        PANIC_WATCHDOG = True
+        USB_RECOVERY_COUNT = 0
+    
+    #if uptime > USB_MAX_UPTIME:
+        #log_event("[USB] Max USB uptime exceeded — resetting devices")
+        #usb_execute("reset")
+        #USB_START_TIME = time.time()
+        #USB_RECOVERY_COUNT = 0
+
+# ===================== TCP =====================
+def send_msg(sock, msg):
+    sock.sendall((msg + "\n").encode())
+
+
+def recv_msg(sock):
+    buffer = ""
+    try:
+        while True:
+            data = sock.recv(1024).decode()
+            if not data:
+                return None
+            buffer += data
+            if "\n" in buffer:
+                msg, _ = buffer.split("\n", 1)
+                return msg.strip()
+    except Exception as e:
+        log_event(f"[RPC] recv_msg failed: {e}")
+        return None
+
+def rpc_call(sock, msg):
+    try:
+        send_msg(sock, msg)
+        return recv_msg(sock)
+    except Exception as e:
+        log_event(f"[RPC] {msg!r} failed: {e}")
+        return None
+
+# ===================== STATE LOOP =====================
+def extract_dev(line):
+    m = re.search(r"serial number=\s*(\d+)", line)
+    return int(m.group(1)) if m else None
+
+def extract_name(line):
+    m = re.search(r"Name=(.*)$", line)
+    return m.group(1).strip() if m else ""
+
+def state_loop():
+    global USB_HEALTH_ERRORS
+    global LAST_USB_RECOVERY
+    global device_counter
+    global conn_clients
+    
+
+    while True:
+        cycle_ok = True
+        last_bad_dev = None
+        device_counter = 0
+        conn_clients = 0
+
+        txt = usb_execute("list")
+
+        if USB_IN_RECOVERY:
+            time.sleep(1)
+            continue
+
+        if not txt:
+            cycle_ok = False
+        else:
+            lines = [l.strip() for l in txt.splitlines() if l.strip()]
+            if not lines:
+                cycle_ok = False
+            else:
+                for line in lines:
+                    devID = extract_dev(line)
+                    if devID is not None:
+                        device_counter += 1
+
+                    if not txt or not lines:
+                        usb_escalating_recover(reason="device list empty")
+
+                    if devID is None:
+                        continue
+
+                    name = extract_name(line)
+                    raw_state = usb_execute("state", devID)
+
+                    if raw_state not in ("0", "1"):
+                        cycle_ok = False
+                        last_bad_dev = devID
+                        break   # stop scanning — failure detected
+
+                    with STATE_CACHE_LOCK:
+                        STATE_CACHE[(server_name, devID)] = raw_state
+                        key = (server_name, devID)
+                        if name != "unknown":
+                            DEVICE_NAME_CACHE[key] = name
+                        elif key not in DEVICE_NAME_CACHE:
+                            DEVICE_NAME_CACHE[key] = "unknown"
+
+
+        # ---- health evaluation (ONCE per cycle) ----
+        if cycle_ok:
+            USB_HEALTH_ERRORS = 0
+        else:
+            USB_HEALTH_ERRORS += 1
+
+        # ---- escalation based on errors ----
+        if USB_HEALTH_ERRORS >= USB_HEALTH_THRESHOLD:
+            log_event("USB health degraded — escalating recovery")
+            usb_escalating_recover(last_bad_dev)
+            USB_HEALTH_ERRORS = 0
+            LAST_USB_RECOVERY = time.time()
+
+        # ---- periodic preventive recovery ----
+        now = time.time()
+        if now - LAST_USB_RECOVERY > USB_RECOVERY_INTERVAL:
+            usb_escalating_recover(reason="periodic refresh")
+            LAST_USB_RECOVERY = now
+
+        # remote nodes via RPC
+        with connected_lock:
+            clients = dict(connected_clients)
+            conn_clients = len(connected_clients)
+
+        for cname, (sock, _) in clients.items():
+            reply = rpc_call(sock, "state_all")
+
+            if not reply:
+                continue
+
+            for entry in reply.split(","):
+                try:
+                    dev, state, name = entry.split(":")
+                    dev = int(dev)
+                    with STATE_CACHE_LOCK:
+                        STATE_CACHE[(cname, dev)] = state.strip()  # raw
+                        DEVICE_NAME_CACHE[(cname, dev)] = name.strip()
+
+                except:
+                    pass
+    
+        time.sleep(STATE_POLL_INTERVAL)
+
+# ============== Watchdog loop ==============
+def watchdog_loop():
+    print("[Watchdog] Started watchdog feeder thread")
+
+    while True:
+        if PANIC_WATCHDOG or USB_IN_RECOVERY:
+            time.sleep(1)
+            continue
+
+        txt = usb_execute("list")
+        if not txt:
+            time.sleep(1)
+            continue
+
+        for line in txt.splitlines():
+            devID = extract_dev(line)
+            if devID is not None:
+                usb_execute("watchdog", devID)
+
+        time.sleep(1)
+
+# ===================== COMMAND =====================
+def execute_cmd(node, dev, action, extra=None):
+    node = node.lower()
+    dev = int(dev)
+
+    # ----- local node -----
+    if node == server_name:
+        result = None
+
+        if action == "toggle":
+            cur = usb_execute("state", dev)
+            new = 0 if cur == "1" else 1
+            result = usb_execute("set", dev, new)
+
+        elif action == "on":
+            result = usb_execute("set", dev, 1)
+
+        elif action == "off":
+            result = usb_execute("set", dev, 0)
+
+        elif action == "rename":
+            result = usb_execute("rename", dev, extra)
+
+        # IMMEDIATE cache refresh for SSE/UI
+        try:
+            new_state = str(usb_execute("state", dev)).strip()
+            with STATE_CACHE_LOCK:
+                STATE_CACHE[(node, dev)] = new_state
+                if action == "rename" and extra is not None:
+                    DEVICE_NAME_CACHE[(node, dev)] = extra
+        except (BrokenPipeError, ConnectionResetError, OSError):
+        # client disconnected – stop sending
+            return
+
+        return result
+
+    # ----- remote node -----
+    with connected_lock:
+        entry = connected_clients.get(node)
+
+    if not entry:
+        return "NOCLIENT"
+
+    sock, _ = entry
+    return rpc_call(sock, f"{action} {dev} {extra or ''}".strip())
+
+# ========== Save page title ==========
+def get_title():
+    global PAGE_TITLE
+    config = configparser.ConfigParser(allow_unnamed_section=True)
+    config.read('ClewareUSB.ini')
+    title = "Cleware Switch Dashboard" #Default title
+    try:
+        NetConfig = config[configparser.UNNAMED_SECTION]
+        PAGE_TITLE = NetConfig.get('title', title)
+    except Exception:
+        pass
+    return PAGE_TITLE
+
+def save_title(new_title):
+    global PAGE_TITLE
+
+    config = configparser.ConfigParser(allow_unnamed_section=True)
+    config.read('ClewareUSB.ini')
+
+    try:
+        NetConfig = config[configparser.UNNAMED_SECTION]
+        host = NetConfig.get('host', '127.0.0.1')
+        port = NetConfig.getint('port', 59001)
+        dll  = NetConfig.get('dll', r"USBaccessX64.dll")
+        PAGE_TITLE = new_title
+    except Exception:
+        pass
+
+    with open("ClewareUSB.ini", "w") as f:
+        f.write(f"host = {host}\nport = {port}\ndll  = USBaccessX64.dll\ntitle = {PAGE_TITLE}")
+
+# ===================== WEB =====================
+class Handler(BaseHTTPRequestHandler):
+
+    def sse_broadcaster():
+            while True:
+                with STATE_CACHE_LOCK:
+                    devices = [
+                        {
+                            "node": node,
+                            "dev": dev,
+                            "name": DEVICE_NAME_CACHE.get((node, dev), ""),
+                            "state": STATE_CACHE.get((node, dev), "?")
+                        }
+                        for (node, dev) in STATE_CACHE
+                    ]
+
+                with EVENT_LOG_LOCK:
+                    events = EVENT_LOG[-20:]
+
+                payload = {
+                    "devices": devices,
+                    "events": events
+                }
+                msg = f"data: {json.dumps(payload)}\n\n".encode()
+
+                with SSE_LOCK:
+                    dead = []
+                    for client in SSE_CLIENTS:
+                        try:
+                            client.write(msg)
+                            client.flush()
+                        except:
+                            dead.append(client)
+                    for d in dead:
+                        SSE_CLIENTS.remove(d)
+
+                time.sleep(2)
+
+    threading.Thread(target=sse_broadcaster, daemon=True).start()
+
+    def do_GET(self):
+        parsed = urlparse(self.path)
+
+        if parsed.path == "/action":
+            q = parse_qs(parsed.query)
+            node = q.get("node", [""])[0]
+            dev = q.get("dev", [""])[0]
+            cmd = q.get("cmd", [""])[0]
+            name = q.get("name", [""])[0]
+
+            execute_cmd(node, dev, cmd, name)
+            log_event(f"[ACTION] {cmd.upper()} {node}:{dev}")
+
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"status":"ok"}')
+            return
+
+        if parsed.path == "/events":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "keep-alive")
+            self.end_headers()
+
+            with SSE_LOCK:
+                SSE_CLIENTS.add(self.wfile)
+
+            try:
+                while True:
+                    time.sleep(60)
+            except:
+                pass
+            finally:
+                with SSE_LOCK:
+                    SSE_CLIENTS.discard(self.wfile)
+            return
+
+# Save page title change via GET: /set_title?title=...
+        if parsed.path == "/set_title":
+            q = parse_qs(parsed.query)
+            new_title = q.get("title", [""])[0]
+            if new_title:
+                global PAGE_TITLE
+                PAGE_TITLE = new_title
+                save_title(new_title)
+                log_event(f"[WEB] Page title updated: {new_title}")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"status":"ok"}')
+            return
+        
+        rows = []
+        with STATE_CACHE_LOCK:
+            for (node, dev), state in STATE_CACHE.items():
+                name = DEVICE_NAME_CACHE.get((node, dev), "")
+                state_txt = "ON" if state == "1" else "OFF" if state == "0" else "?"
+                state_class = "state-on" if state == "1" else "state-off" if state == "0" else "state-unk"
+
+                rows.append(f"""
+                <tr data-key="{node}:{dev}">
+                    <td>{node}</td>
+                    <td>{dev}</td>
+                    <td>{name}</td>
+                    <td class='{state_class}'>{state_txt}</td>
+                    <td>
+                        <a class='btn' href='#' onclick="doAction('{node}','{dev}','on')">On</a>
+                        <a class='btn' href='#' onclick="doAction('{node}','{dev}','off')">Off</a>
+                        <a class='btn' href='#' onclick="doAction('{node}','{dev}','toggle')">Toggle</a>                      
+                        <form style='display:inline' action='/action' onsubmit="renameDevice(event, this)">
+                            <input type='hidden' name='node' value='{node}'>
+                            <input type='hidden' name='dev' value='{dev}'>
+                            <input type='hidden' name='cmd' value='rename'>
+                            <input name='name' placeholder='Rename (press Enter)'>
+                        </form>
+                    </td>
+                </tr>
+                """)
+
+        html = f"""
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset='UTF-8'>
+<title>Cleware Switch Dashboard</title>
+<style>
+body {{ font-family: Arial; background:#1e1e1e; color:#ddd; margin:20px; }}
+h2 {{ color:#4fc3f7; }}
+table {{ border-collapse:collapse; width:100%; background:#2a2a2a; text-align: center;}}
+th,td {{ padding:10px; border-bottom:1px solid #444; }}
+th {{ background:#333; cursor:pointer; }}
+tr:hover {{ background:#3a3a3a; }}
+a {{ color:#4fc3f7; margin-right:5px; }}
+a.btn {{
+    display: inline-block; padding: 4px 8px; margin-right: 6px;
+    border: 1px solid #aaa; border-radius: 4px;
+    background: #eee; color: #000; text-decoration: none;
+}}
+a.btn:hover {{ background: #ddd; }}
+input {{ padding:4px; }}
+.state-on {{ color:#4caf50; font-weight: bold;}}
+.state-off {{ color:#f44336; font-weight: bold;}}
+.state-unk {{ color:#aaa; font-weight: bold;}}
+#layout {{
+    display: flex;
+    gap: 20px;
+}}
+
+#devices {{
+    flex: 3;
+}}
+
+#events {{
+    flex: 1;
+    background: #111;
+    border: 1px solid #444;
+    padding: 10px;
+    max-height: 500px;
+    overflow-y: auto;
+}}
+
+#events h3 {{
+    margin-top: 0;
+    color: #4fc3f7;
+}}
+
+#eventLog {{
+    font-size: 12px;
+    white-space: pre-wrap;
+}}
+
+</style>
+</head>
+<body>
+<h1><span id="title">{get_title()}</span> <span id="editTitle">{EDIT_TITLE}</span></h1>
+<h2>Server: {server_name} 
+<span style="color:white;font-size:smaller;"> Local Cleware devices: {device_counter}</span> 
+<span style="color:grey;">Connected clients: {conn_clients}</span>
+</h2>
+
+<div id="layout">
+    <div id="devices">
+        <table id='deviceTable'>
+            <tr>
+                <th onclick="sortTable(0)">Node</th>
+                <th onclick="sortTable(1)">ID</th>
+                <th onclick="sortTable(2)">Name</th>
+                <th>State</th>
+                <th>Actions</th>
+            </tr>
+            {''.join(rows)}
+        </table>
+    </div>
+
+    <div id="events">
+        <h3>Event Log</h3>
+        <pre id="eventLog"></pre>
+    </div>
+</div>
+
+<script>
+// rename h1 title on EDIT_TITLE click
+document.querySelector("#editTitle").addEventListener("click", () => {{
+    const current = document.querySelector("#title").textContent;
+    const newTitle = prompt("Enter new dashboard title:", current);
+    if (newTitle && newTitle !== current) {{
+        fetch("/set_title?title=" + encodeURIComponent(newTitle))
+            .then(r => {{
+                if (r.ok) {{
+                    document.title = newTitle;
+                    document.querySelector("#title").textContent = newTitle;
+                }} else {{
+                    alert("Failed to save title");
+                }}
+            }})
+            .catch(() => alert("Failed to save title"));
+    }}
+}});
+
+// sorting
+function sortTable(col) {{
+    let table = document.getElementById("deviceTable");
+    let rows = Array.from(table.rows).slice(1);
+    let asc = table.getAttribute("data-sort") !== "asc";
+
+    rows.sort((a, b) => {{
+        let A = a.cells[col].innerText.toLowerCase();
+        let B = b.cells[col].innerText.toLowerCase();
+
+        if (!isNaN(A) && !isNaN(B)) {{
+            return asc ? A - B : B - A;
+        }}
+        return asc ? A.localeCompare(B) : B.localeCompare(A);
+    }});
+
+    rows.forEach(r => table.appendChild(r));
+    table.setAttribute("data-sort", asc ? "asc" : "desc");
+}}
+
+// Auto refresh after action
+function doAction(node, dev, cmd) {{
+    fetch(`/action?node=${{node}}&dev=${{dev}}&cmd=${{cmd}}`)
+}}
+
+// Auto refresh after renaming
+function renameDevice(ev, form) {{
+    ev.preventDefault();
+    const data = new FormData(form);
+    const params = new URLSearchParams(data).toString();
+    fetch("/action?" + params);
+}}
+</script>
+<script>
+const evtSource = new EventSource("/events");
+
+evtSource.onmessage = function (e) {{
+    const data = JSON.parse(e.data);
+
+    // --- update device table ---
+    const rows = {{}};
+    document.querySelectorAll("#deviceTable tr[data-key]").forEach(tr => {{
+        rows[tr.dataset.key] = tr;
+    }});
+
+    data.devices.forEach(d => {{
+        const key = `${{d.node}}:${{d.dev}}`;
+        let tr = rows[key];
+
+        const stateTxt = d.state === "1" ? "ON" :
+                         d.state === "0" ? "OFF" : "?";
+        const stateClass = d.state === "1" ? "state-on" :
+                           d.state === "0" ? "state-off" : "state-unk";
+
+        if (!tr) {{
+            // device not yet rendered – ignore, will appear on next full refresh
+            return;
+        }}
+
+        tr.children[2].textContent = d.name;
+        tr.children[3].textContent = stateTxt;
+        tr.children[3].classList.remove("state-on", "state-off", "state-unk");
+        tr.children[3].classList.add(stateClass);
+
+    }});
+
+    // --- update event log ---
+    document.getElementById("eventLog").textContent =
+        data.events.join("\\n");
+}};
+</script>
+</body>
+</html>
+"""
+
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(html.encode())
+
+
+# ===================== SERVER =====================
+def accept_loop(sock):
+    global conn_clients
+
+    while True:
+        #conn_clients = 0
+        try:
+            conn, addr = sock.accept()
+            name = recv_msg(conn)
+
+            if not name or not name.startswith("HELLO "):
+                conn.close()
+                continue
+
+            cname = name.split()[1]
+
+            with connected_lock:
+                connected_clients[cname] = (conn, addr)
+
+            log_event(f"Client connected: {cname}")
+            #conn_clients += 1
+
+        except:
+            time.sleep(0.1)
+
+# ===================== MAIN =====================
+def main():
+    global server_name
+
+    server_name = socket.gethostname().lower()
+
+    cwUSB_setup()
+    #print("Cleware devices found:", cwiNoOfDevices)
+    
+    #start threads AFTER setup
+    threading.Thread(target=usb_worker, daemon=True).start()
+    threading.Thread(target=state_loop, daemon=True).start()
+    threading.Thread(target=watchdog_loop, daemon=True).start()
+
+
+    host, port, _ = cwUSB_getConfig()
+
+    s = socket.socket()
+    s.bind(("", port))
+    s.listen()
+
+    threading.Thread(target=accept_loop, args=(s,), daemon=True).start()
+
+    web = ThreadingHTTPServer(("0.0.0.0", WEB_PORT), Handler)
+
+    # Enable SSL
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain("localhost+1.pem", "localhost+1-key.pem")
+    web.socket = ctx.wrap_socket(web.socket, server_side=True)
+    
+    web.serve_forever()
+
+
+if __name__ == "__main__":
+    main()
